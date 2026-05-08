@@ -1,0 +1,79 @@
+{
+  "cycle_timestamp": "2026-05-08T16:07:22.916388",
+  "provider": "groq/llama-3.3-70b-versatile",
+  "account": {
+    "account_value": 1000.0,
+    "cash": 1000.0,
+    "buying_power": 1000.0,
+    "daytrade_count": 0,
+    "pattern_day_trader": false,
+    "trading_blocked": false,
+    "account_blocked": false,
+    "positions_count": 0,
+    "positions": [],
+    "is_paper": true
+  },
+  "market_context": {
+    "indices": {
+      "SPY": {
+        "price": 659.22,
+        "5d_change_pct": 4.31,
+        "20d_change_pct": -2.81,
+        "above_ma20": true,
+        "rsi14": 43.3
+      },
+      "QQQ": {
+        "price": 588.59,
+        "5d_change_pct": 5.43,
+        "20d_change_pct": -3.15,
+        "above_ma20": true,
+        "rsi14": 42.2
+      },
+      "IWM": {
+        "price": 252.91,
+        "5d_change_pct": 5.55,
+        "20d_change_pct": -0.28,
+        "above_ma20": true,
+        "rsi14": 53.1
+      }
+    },
+    "market_status": {
+      "is_open": false,
+      "next_open": "2026-05-11T09:30:00-04:00",
+      "next_close": "2026-05-11T16:00:00-04:00",
+      "current_time": "2026-05-08T19:07:15.981929-04:00"
+    }
+  },
+  "screener_universe": [
+    "AVGO",
+    "CRWD",
+    "PANW",
+    "AMD",
+    "GOOGL",
+    "CEG",
+    "SMH",
+    "PLTR",
+    "COIN",
+    "NVDA",
+    "FTNT",
+    "MS",
+    "C",
+    "GS",
+    "BAC",
+    "XOM",
+    "AMZN",
+    "AAPL",
+    "NFLX",
+    "SMCI"
+  ],
+  "deep_candidates": [
+    "AVGO",
+    "CRWD",
+    "AMD",
+    "GOOGL",
+    "CEG"
+  ],
+  "llm_response": "",
+  "dry_run": true,
+  "_written_at": "2026-05-08T16:07:22.916408"
+}

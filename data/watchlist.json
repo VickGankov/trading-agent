@@ -1,0 +1,39 @@
+{
+  "_comment": "Priority watchlist - these get analyzed every cycle. Screener fills in the rest from market scanners.",
+  "priority_tickers": [
+    {"symbol": "NVDA", "sector": "semis", "notes": "AI infrastructure leader. Earnings May 20 2026 - avoid 3 days before."},
+    {"symbol": "GOOGL", "sector": "mega_tech", "notes": "Q1 EPS +94% beat. Cloud +63% YoY."},
+    {"symbol": "PLTR", "sector": "ai_software", "notes": "Q1 reported May 4. Volatile. Next earnings Aug 3."},
+    {"symbol": "AVGO", "sector": "semis", "notes": "Custom AI silicon. Watch $410-432 entry zone."},
+    {"symbol": "AMD", "sector": "semis", "notes": "Just gapped +18% on May 6. Wait for consolidation."},
+    {"symbol": "META", "sector": "mega_tech", "notes": "Q1 strong, capex guide $145B."},
+    {"symbol": "MSFT", "sector": "mega_tech", "notes": "Capex raised $25B. Stable mega-cap."},
+    {"symbol": "TSM", "sector": "semis", "notes": "Foundry leader. Geopolitical risk."},
+    {"symbol": "CRWD", "sector": "cybersecurity", "notes": "Cyber AI infrastructure."},
+    {"symbol": "CEG", "sector": "ai_power", "notes": "Earnings May 11 - avoid new positions May 8-11."},
+    {"symbol": "VST", "sector": "ai_power", "notes": "Earnings May 7 - avoid until after report."},
+    {"symbol": "TSLA", "sector": "mega_tech", "notes": "High beta. Robotaxi narrative."},
+    {"symbol": "COIN", "sector": "crypto_equity", "notes": "Beta 3.36. High volatility."}
+  ],
+  "screener_filters": {
+    "min_price": 5.00,
+    "max_price": 500.00,
+    "min_avg_volume": 1000000,
+    "min_market_cap": 1000000000,
+    "exclude_leveraged_etfs": ["TQQQ", "SQQQ", "SOXL", "SOXS", "TNA", "TZA", "UPRO", "SPXU", "TMF", "TMV"],
+    "exclude_otc": true
+  },
+  "screener_universe": [
+    "SPY", "QQQ", "IWM", "DIA",
+    "SMH", "XLK", "XLF", "XLE", "XLV", "XLI", "XLU", "XLP", "XLY", "XLB", "XLRE", "XLC",
+    "ITA", "URA", "CIBR", "ARKK", "IBIT", "FBTC"
+  ],
+  "indices_to_track": {
+    "SPY": "S&P 500",
+    "QQQ": "Nasdaq 100",
+    "IWM": "Russell 2000",
+    "VIX_proxy": "VIXY"
+  },
+  "max_candidates_per_cycle": 20,
+  "max_deep_analysis_per_cycle": 5
+}
