@@ -45,6 +45,9 @@ except ImportError:
 from dotenv import load_dotenv
 load_dotenv()
 
+# Per-process cache so one cycle doesn't re-fetch the same symbol's bars/technicals
+_tech_cache: dict = {}
+
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER = os.getenv("PAPER", "True").lower() == "true"
@@ -178,7 +181,9 @@ def get_news(symbol: Optional[str] = None, hours: int = 24):
 
 
 def calc_technicals(symbol: str):
-    """Calculate MA20, MA50, RSI14, volume vs average."""
+    """Calculate MA20, MA50, RSI14, volume vs average. Cached per process."""
+    if symbol in _tech_cache:
+        return _tech_cache[symbol]
     bars_data = get_bars(symbol, days=60)
     if "error" in bars_data or len(bars_data["bars"]) < 20:
         return {"symbol": symbol, "error": "insufficient data"}
@@ -203,7 +208,7 @@ def calc_technicals(symbol: str):
     df["vol_ratio"] = df["volume"] / df["vol_avg20"]
     
     last = df.iloc[-1]
-    return {
+    result = {
         "symbol": symbol,
         "current_price": round(float(last["close"]), 2),
         "ma20": round(float(last["ma20"]), 2) if not pd.isna(last["ma20"]) else None,
@@ -217,6 +222,8 @@ def calc_technicals(symbol: str):
         "5d_change_pct": round(float((last["close"] / df["close"].iloc[-6] - 1) * 100), 2) if len(df) >= 6 else None,
         "20d_change_pct": round(float((last["close"] / df["close"].iloc[-21] - 1) * 100), 2) if len(df) >= 21 else None
     }
+    _tech_cache[symbol] = result
+    return result
 
 
 def get_market_snapshot():

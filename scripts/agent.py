@@ -63,24 +63,15 @@ CLAUDE_MD = Path(__file__).parent.parent / "CLAUDE.md"
 WATCHLIST_PATH = Path(__file__).parent.parent / "data" / "watchlist.json"
 
 # Condensed system prompt for Groq (stays under 12K TPM free tier limit)
-GROQ_SYSTEM = """You are a disciplined paper trading agent. Rules:
-- Long-only, paper account, $1000 capital
-- Max 10% per position = MAX $100 total order value (qty × entry_limit ≤ $100)
-- Min $50 order value, max 5 positions open, always keep $250+ in cash
-- Every BUY: stop-loss 3-10% below entry, take-profit at least 1.5× the risk distance
-- No leveraged ETFs, no earnings gambles (avoid if earnings within 3 days)
-- Default to NO TRADE. Only trade specific setups with clear catalysts.
+GROQ_SYSTEM = """Disciplined paper trading agent. $1000 account. Rules:
+- Long-only. Max $100/position (10%). Min $50. Max 5 open. Keep $250+ cash.
+- Every BUY needs stop 3-10% below entry, take-profit ≥1.5× risk. No leveraged ETFs. No earnings within 3 days.
+- qty=floor(100/entry_limit). If qty=0 → NO TRADE. Default to NO TRADE.
 
-POSITION SIZING EXAMPLE: If entry_limit=$200, max qty=floor(100/200)=0 → NO TRADE (too expensive for 1 share).
-If entry_limit=$80, max qty=floor(100/80)=1 share ($80 order value, within limits).
-Always compute qty = floor(account_value * 0.10 / entry_limit). If that gives 0, output NO TRADE instead.
-
-For each candidate output exactly one JSON decision block on its own line:
+One JSON block per candidate (on its own line):
 {"action":"BUY","ticker":"X","qty":1,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"..."}
-or
 {"action":"NO TRADE","ticker":"X","reason":"..."}
-
-Then write a brief reflection. Be analytical, not optimistic."""
+Then a brief reflection."""
 
 
 def load_system_prompt():
@@ -477,10 +468,11 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
         for m in data["all_movers"]
     )
 
-    # Compact technicals for top 5 deep candidates only
+    # Compact technicals — omit fields already in screener summary (5d_change_pct, vol_ratio)
+    # and derivable ones (above_ma20 = price > ma20)
     compact_tech = {
         sym: {k: v for k, v in t.items() if k in
-              ("current_price", "ma20", "ma50", "rsi14", "vol_ratio", "above_ma20", "5d_change_pct")}
+              ("current_price", "ma20", "ma50", "rsi14")}
         for sym, t in data["technicals"].items()
         if "error" not in t
     }
@@ -512,8 +504,12 @@ For each of the 5 deep candidates output a JSON decision block, then a brief ref
     if not dry_run and not premarket:
         _execute_from_text(response_text, data["account"])
 
-    # Write journal
+    # Write journal with structured decisions so the dashboard can parse them
     try:
+        decisions = _parse_decisions_from_text(response_text)
+        # Extract reflection (non-JSON text after the last decision block)
+        import re as _re
+        reflection = _re.sub(r'\{[^{}]*"action"[^{}]*\}', '', response_text, flags=_re.DOTALL).strip()
         journal_module.write_entry({
             "cycle_timestamp": datetime.now().isoformat(),
             "provider": f"{LLM_PROVIDER}/{MODEL}",
@@ -521,7 +517,8 @@ For each of the 5 deep candidates output a JSON decision block, then a brief ref
             "market_context": data["market"],
             "screener_universe": [m["symbol"] for m in data["all_movers"]],
             "deep_candidates": data["deep_candidates"],
-            "llm_response": response_text[:2000],
+            "decisions": decisions,
+            "reflection": reflection[:500],
             "dry_run": dry_run,
         })
         print("\n[Journal entry written]")
@@ -529,40 +526,41 @@ For each of the 5 deep candidates output a JSON decision block, then a brief ref
         print(f"\n[Journal write failed: {e}]")
 
 
-def _execute_from_text(text: str, account: dict):
-    """
-    Parse BUY/SELL decisions from LLM text response and execute them.
-    Looks for JSON blocks in the response.
-    """
+def _parse_decisions_from_text(text: str) -> list:
+    """Extract all JSON decision blocks from LLM response text."""
     import re
-    # Find JSON blocks
-    json_blocks = re.findall(r'\{[^{}]*"action"\s*:\s*"BUY"[^{}]*\}', text, re.DOTALL)
-    json_blocks += re.findall(r'\{[^{}]*"action"\s*:\s*"SELL"[^{}]*\}', text, re.DOTALL)
-
-    for block in json_blocks:
+    decisions = []
+    # Match any top-level JSON object containing an "action" key
+    for block in re.findall(r'\{[^{}]*"action"\s*:\s*"[^"]*"[^{}]*\}', text, re.DOTALL):
         try:
-            decision = json.loads(block)
-            action = decision.get("action", "")
-            ticker = decision.get("ticker", "")
-            if action == "BUY" and ticker:
-                result = trade_module.place_buy(
-                    ticker,
-                    int(decision.get("qty", 1)),
-                    float(decision.get("entry_limit", decision.get("entry", 0))),
-                    float(decision.get("stop_loss", decision.get("stop", 0))),
-                    float(decision.get("take_profit", decision.get("target", 0))),
-                    decision.get("thesis", "agent decision")
-                )
-                print(f"\n→ ORDER: {json.dumps(result)}")
-            elif action == "SELL" and ticker:
-                result = trade_module.place_sell(
-                    ticker,
-                    int(decision.get("qty", 1)),
-                    decision.get("reason", "agent decision")
-                )
-                print(f"\n→ ORDER: {json.dumps(result)}")
+            decisions.append(json.loads(block))
         except Exception:
             continue
+    return decisions
+
+
+def _execute_from_text(text: str, account: dict):
+    """Parse and execute BUY/SELL decisions from LLM response text."""
+    for decision in _parse_decisions_from_text(text):
+        action = decision.get("action", "")
+        ticker = decision.get("ticker", "")
+        if action == "BUY" and ticker:
+            result = trade_module.place_buy(
+                ticker,
+                int(decision.get("qty", 1)),
+                float(decision.get("entry_limit", decision.get("entry", 0))),
+                float(decision.get("stop_loss", decision.get("stop", 0))),
+                float(decision.get("take_profit", decision.get("target", 0))),
+                decision.get("thesis", "agent decision")
+            )
+            print(f"\n→ ORDER: {json.dumps(result)}")
+        elif action == "SELL" and ticker:
+            result = trade_module.place_sell(
+                ticker,
+                int(decision.get("qty", 1)),
+                decision.get("reason", "agent decision")
+            )
+            print(f"\n→ ORDER: {json.dumps(result)}")
 
 
 def run_cycle(dry_run: bool = False, premarket: bool = False):

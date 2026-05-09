@@ -20,6 +20,7 @@ import sys
 import json
 import argparse
 from datetime import datetime
+from pathlib import Path
 from typing import Optional
 
 try:
@@ -55,6 +56,9 @@ DAILY_LOSS_LIMIT_PCT = 3.0      # Halt if account down 3% in a day
 MIN_PRICE = 5.0                 # No penny stocks
 MAX_PRICE = 500.0               # No ultra-high priced stocks (fractional sizing complexity)
 
+WEEKLY_LOSS_LIMIT_PCT = 8.0         # Halt week if account drops 8%
+STATE_FILE = Path(__file__).parent.parent / "data" / "state.json"
+
 LEVERAGED_ETFS = {
     "TQQQ", "SQQQ", "SOXL", "SOXS", "TNA", "TZA", "UPRO", "SPXU",
     "TMF", "TMV", "FAS", "FAZ", "LABU", "LABD", "BOIL", "KOLD",
@@ -66,6 +70,46 @@ if not API_KEY or not SECRET_KEY:
     sys.exit(1)
 
 trading = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
+
+
+def _load_state() -> dict:
+    try:
+        return json.loads(STATE_FILE.read_text()) if STATE_FILE.exists() else {}
+    except Exception:
+        return {}
+
+
+def _save_state(state: dict):
+    STATE_FILE.parent.mkdir(exist_ok=True)
+    STATE_FILE.write_text(json.dumps(state, indent=2))
+
+
+def check_weekly_circuit_breaker(current_equity: float) -> tuple:
+    """
+    Returns (tripped: bool, message: str).
+    Resets week_start_equity each Monday. Halts buys if down 8% from week open.
+    """
+    state = _load_state()
+    today = datetime.now()
+    iso_week = today.strftime("%G-W%V")  # e.g. "2026-W20"
+
+    if state.get("week_key") != iso_week:
+        # New week — record starting equity
+        state = {"week_key": iso_week, "week_start_equity": current_equity}
+        _save_state(state)
+        return False, "OK"
+
+    week_start = state.get("week_start_equity", current_equity)
+    if week_start <= 0:
+        return False, "OK"
+
+    weekly_change_pct = ((current_equity - week_start) / week_start) * 100
+    if weekly_change_pct <= -WEEKLY_LOSS_LIMIT_PCT:
+        return True, (
+            f"Weekly loss circuit breaker: account down {weekly_change_pct:.2f}% "
+            f"from ${week_start:.2f} → ${current_equity:.2f}. No new buys this week."
+        )
+    return False, "OK"
 
 
 def get_account_state():
@@ -105,7 +149,13 @@ def validate_order(symbol: str, side: str, qty: int, limit_price: Optional[float
         day_change_pct = ((state["equity"] - state["last_equity"]) / state["last_equity"]) * 100
         if day_change_pct <= -DAILY_LOSS_LIMIT_PCT and side == "buy":
             return False, f"Daily loss circuit breaker tripped ({day_change_pct:.2f}%). No new buys today."
-    
+
+    # 2b. Weekly loss circuit breaker
+    if side == "buy":
+        tripped, msg = check_weekly_circuit_breaker(state["equity"])
+        if tripped:
+            return False, msg
+
     # 3. Excluded instruments
     if symbol in LEVERAGED_ETFS:
         return False, f"{symbol} is a leveraged ETF — forbidden by hard rules"
