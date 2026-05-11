@@ -218,22 +218,36 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
 
 
 def place_buy(symbol: str, qty: float, limit_price: float, stop_price: float, target_price: float, reason: str):
-    """Place a bracket BUY order (entry + stop + target as one order)."""
+    """
+    Place a BUY order. Whole shares get a bracket order (entry + stop + target atomic).
+    Fractional shares get a simple limit order — Alpaca doesn't support bracket on fractions.
+    """
     valid, msg = validate_order(symbol, "buy", qty, limit_price, stop_price, target_price)
     if not valid:
         return {"status": "REJECTED", "reason": msg, "symbol": symbol, "side": "buy", "qty": qty}
-    
+
+    is_fractional = (qty % 1) != 0
+
     try:
-        order = trading.submit_order(LimitOrderRequest(
-            symbol=symbol,
-            qty=qty,
-            side=OrderSide.BUY,
-            time_in_force=TimeInForce.DAY,
-            limit_price=round(limit_price, 2),
-            order_class=OrderClass.BRACKET,
-            stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
-            take_profit=TakeProfitRequest(limit_price=round(target_price, 2))
-        ))
+        if is_fractional:
+            order = trading.submit_order(LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(limit_price, 2),
+            ))
+        else:
+            order = trading.submit_order(LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.BUY,
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(limit_price, 2),
+                order_class=OrderClass.BRACKET,
+                stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+                take_profit=TakeProfitRequest(limit_price=round(target_price, 2))
+            ))
         return {
             "status": "SUBMITTED",
             "order_id": str(order.id),
@@ -243,6 +257,8 @@ def place_buy(symbol: str, qty: float, limit_price: float, stop_price: float, ta
             "limit_price": limit_price,
             "stop_loss": stop_price,
             "take_profit": target_price,
+            "order_type": "simple_limit" if is_fractional else "bracket",
+            "note": "Manual stop/target required — Alpaca bracket orders don't support fractional qty" if is_fractional else None,
             "reason": reason,
             "timestamp": datetime.now().isoformat()
         }

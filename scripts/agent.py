@@ -66,7 +66,7 @@ WATCHLIST_PATH = Path(__file__).parent.parent / "data" / "watchlist.json"
 GROQ_SYSTEM = """Disciplined paper trading agent. $1000 account. Rules:
 - Long-only. Max $100/position (10%). Min $50 order value. Max 5 open. Keep $250+ cash.
 - Every BUY needs stop 3-10% below entry, take-profit ≥1.5× risk. No leveraged ETFs. No earnings within 3 days.
-- Fractional shares supported. qty=round(100/entry_limit, 2). If order value <$50 → NO TRADE.
+- Fractional shares supported. qty=floor(100/entry_limit * 100)/100 (floor, not round — must stay ≤$100). If order value <$50 → NO TRADE.
 - Default to NO TRADE unless setup is specific and compelling.
 
 One JSON block per candidate (on its own line):
@@ -542,13 +542,17 @@ def _parse_decisions_from_text(text: str) -> list:
 
 def _execute_from_text(text: str, account: dict):
     """Parse and execute BUY/SELL decisions from LLM response text."""
+    import math
     for decision in _parse_decisions_from_text(text):
         action = decision.get("action", "")
         ticker = decision.get("ticker", "")
         if action == "BUY" and ticker:
+            # Floor to 2 decimal places — LLMs sometimes round up, pushing past the 10% limit
+            raw_qty = float(decision.get("qty", 0))
+            qty = math.floor(raw_qty * 100) / 100
             result = trade_module.place_buy(
                 ticker,
-                round(float(decision.get("qty", 0)), 2),
+                qty,
                 float(decision.get("entry_limit", decision.get("entry", 0))),
                 float(decision.get("stop_loss", decision.get("stop", 0))),
                 float(decision.get("take_profit", decision.get("target", 0))),
