@@ -64,12 +64,13 @@ WATCHLIST_PATH = Path(__file__).parent.parent / "data" / "watchlist.json"
 
 # Condensed system prompt for Groq (stays under 12K TPM free tier limit)
 GROQ_SYSTEM = """Disciplined paper trading agent. $1000 account. Rules:
-- Long-only. Max $100/position (10%). Min $50. Max 5 open. Keep $250+ cash.
+- Long-only. Max $100/position (10%). Min $50 order value. Max 5 open. Keep $250+ cash.
 - Every BUY needs stop 3-10% below entry, take-profit ≥1.5× risk. No leveraged ETFs. No earnings within 3 days.
-- qty=floor(100/entry_limit). If qty=0 → NO TRADE. Default to NO TRADE.
+- Fractional shares supported. qty=round(100/entry_limit, 2). If order value <$50 → NO TRADE.
+- Default to NO TRADE unless setup is specific and compelling.
 
 One JSON block per candidate (on its own line):
-{"action":"BUY","ticker":"X","qty":1,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"..."}
+{"action":"BUY","ticker":"X","qty":0.00,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"..."}
 {"action":"NO TRADE","ticker":"X","reason":"..."}
 Then a brief reflection."""
 
@@ -170,7 +171,7 @@ TOOLS = [
             "type": "object",
             "properties": {
                 "symbol": {"type": "string"},
-                "qty": {"type": "integer"},
+                "qty": {"type": "number", "description": "Fractional shares allowed, e.g. 0.28"},
                 "limit_price": {"type": "number"},
                 "stop_price": {"type": "number"},
                 "target_price": {"type": "number"},
@@ -259,7 +260,7 @@ def dispatch_tool(name: str, inputs: dict, dry_run: bool = False) -> dict:
                 )
                 return {"status": "DRY_RUN", "would_be_valid": valid, "validation_msg": msg, **inputs}
             return trade_module.place_buy(
-                inputs["symbol"], inputs["qty"], inputs["limit_price"],
+                inputs["symbol"], round(float(inputs["qty"]), 2), inputs["limit_price"],
                 inputs["stop_price"], inputs["target_price"], inputs["reason"]
             )
         elif name == "place_sell":
@@ -547,7 +548,7 @@ def _execute_from_text(text: str, account: dict):
         if action == "BUY" and ticker:
             result = trade_module.place_buy(
                 ticker,
-                int(decision.get("qty", 1)),
+                round(float(decision.get("qty", 0)), 2),
                 float(decision.get("entry_limit", decision.get("entry", 0))),
                 float(decision.get("stop_loss", decision.get("stop", 0))),
                 float(decision.get("take_profit", decision.get("target", 0))),
@@ -557,7 +558,7 @@ def _execute_from_text(text: str, account: dict):
         elif action == "SELL" and ticker:
             result = trade_module.place_sell(
                 ticker,
-                int(decision.get("qty", 1)),
+                round(float(decision.get("qty", 0)), 2),
                 decision.get("reason", "agent decision")
             )
             print(f"\n→ ORDER: {json.dumps(result)}")

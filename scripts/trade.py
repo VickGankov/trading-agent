@@ -54,7 +54,7 @@ MAX_STOP_PCT = 10.0             # Stop at most 10% below entry (caps risk)
 MIN_RR_RATIO = 1.5              # Take-profit at least 1.5x the risk
 DAILY_LOSS_LIMIT_PCT = 3.0      # Halt if account down 3% in a day
 MIN_PRICE = 5.0                 # No penny stocks
-MAX_PRICE = 500.0               # No ultra-high priced stocks (fractional sizing complexity)
+MAX_PRICE = 1500.0              # Cap — fractional shares supported
 
 WEEKLY_LOSS_LIMIT_PCT = 8.0         # Halt week if account drops 8%
 STATE_FILE = Path(__file__).parent.parent / "data" / "state.json"
@@ -129,7 +129,7 @@ def get_account_state():
     }
 
 
-def validate_order(symbol: str, side: str, qty: int, limit_price: Optional[float],
+def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[float],
                    stop_price: Optional[float], target_price: Optional[float]) -> tuple:
     """
     Pre-flight validation. Returns (is_valid: bool, message: str).
@@ -217,7 +217,7 @@ def validate_order(symbol: str, side: str, qty: int, limit_price: Optional[float
     return True, "OK"
 
 
-def place_buy(symbol: str, qty: int, limit_price: float, stop_price: float, target_price: float, reason: str):
+def place_buy(symbol: str, qty: float, limit_price: float, stop_price: float, target_price: float, reason: str):
     """Place a bracket BUY order (entry + stop + target as one order)."""
     valid, msg = validate_order(symbol, "buy", qty, limit_price, stop_price, target_price)
     if not valid:
@@ -250,7 +250,7 @@ def place_buy(symbol: str, qty: int, limit_price: float, stop_price: float, targ
         return {"status": "ERROR", "error": str(e), "symbol": symbol}
 
 
-def place_sell(symbol: str, qty: int, reason: str):
+def place_sell(symbol: str, qty: float, reason: str):
     """Sell an existing position."""
     valid, msg = validate_order(symbol, "sell", qty, None, None, None)
     if not valid:
