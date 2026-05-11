@@ -177,3 +177,53 @@ Your goal is not to make $X per week. Your goal is to **demonstrate whether the 
 Process > P&L. Discipline > activity. Skipping a marginal trade is a win.
 
 When in doubt, do nothing. The market will be open tomorrow.
+
+---
+
+## DEVELOPER NOTES — Code Architecture & Session Continuity
+
+*This section is for Claude Code sessions picking up development. Read this instead of re-reading all source files.*
+
+### Repo
+GitHub: https://github.com/VickGankov/trading-agent (public)
+Stack: Python 3.10, alpaca-py, pandas, numpy, openai (Groq client), streamlit, plotly
+Venv: `.venv/` — activate with `.venv/bin/python` or `.venv/bin/streamlit`
+Credentials: `.env` (gitignored) — ALPACA_API_KEY, ALPACA_SECRET_KEY, GROQ_API_KEY, LLM_PROVIDER=groq
+
+### File Map
+| File | Purpose |
+|------|---------|
+| `scripts/research.py` | Alpaca market data — bars, quotes, news, technicals, screener. Has per-process `_tech_cache` dict to avoid redundant bar fetches within one cycle. |
+| `scripts/trade.py` | Order placement with hard guardrails. `validate_order()` enforces all risk rules. `place_buy()` uses bracket order for whole shares, simple limit for fractional (Alpaca rejects bracket+fractional). Weekly circuit breaker reads/writes `data/state.json`. |
+| `scripts/agent.py` | Cycle orchestrator. Two paths: Groq (single-shot, free) and Anthropic (agentic tool-use loop). `_parse_decisions_from_text()` extracts JSON decision blocks from LLM output. `--status` flag for quick portfolio snapshot, `--dry-run` skips order submission, `--premarket` for pre-market scan. |
+| `scripts/journal.py` | Writes JSON cycle entries to `journal/YYYY-MM-DD_HHMMSS.json`. Groq path now writes structured `decisions` array (not raw text) so dashboard stats work. |
+| `dashboard.py` | Streamlit dashboard. Run: `.venv/bin/streamlit run dashboard.py` → localhost:8501 |
+| `data/watchlist.json` | Priority tickers + screener filters + universe |
+| `data/state.json` | Weekly circuit breaker state — `week_key` (ISO week) + `week_start_equity`. Resets each Monday. |
+
+### Dispatch Routines (claude.ai/code/routines)
+| Routine | ID | Schedule |
+|---------|-----|---------|
+| Trading Bot — Market Hours | `trig_01BcF8NDAzop79Sny9eikgsx` | 10AM, 12PM, 2PM EDT weekdays |
+| Trading Bot — Premarket | `trig_01A8TpDuccecRwZp6BpkqpwW` | 8:30AM EDT weekdays |
+
+Both clone this repo, pip install deps, write `.env` with credentials from the prompt, run `agent.py`, and send a push notification. Use `RemoteTrigger` tool to enable/disable/trigger.
+
+### Fractional Shares — Key Constraint
+Alpaca error 42210000: bracket orders reject fractional qty. Workaround in `place_buy()`:
+- `qty >= 1` → bracket order (entry + stop + target, atomic)
+- `qty < 1` → simple limit order only (NO automatic stop-loss)
+
+**Implication:** fractional positions need manual stop monitoring each cycle. The agent should check open fractional positions against their stated stop levels on each cycle and call `place_sell()` if breached.
+
+### Known Gaps (prioritized)
+1. **Fractional stop monitoring** — agent doesn't yet check fractional positions against stop levels each cycle. Needs a `check_fractional_stops()` call in `run_cycle()` that reads open positions + their stop prices from the journal and exits if breached.
+2. **Earnings calendar is hardcoded** — `check_earnings_calendar()` in research.py uses a static dict. Needs `yfinance` or Finnhub for live data.
+3. **Screener uses static universe** — `screener_movers()` fetches technicals on a hardcoded list, not a real-time most-active feed.
+4. **Anthropic provider not configured** — `ANTHROPIC_API_KEY` is placeholder. Anthropic path uses full tool-use loop with CLAUDE.md as system prompt + prompt caching (not yet added — add `cache_control` to system prompt for ~90% input token savings on repeated turns).
+5. **Trade P&L ledger** — no win/loss tracking yet. Build once positions start closing.
+
+### Current Account State (as of 2026-05-11)
+- Paper account: $1,000 starting capital
+- Active orders: AMD 0.43sh @ $231.82 limit, CRWD 0.23sh @ $426.51 limit (DAY orders — may have expired at close)
+- Week start equity: $1,000 (2026-W19, tracked in data/state.json)
