@@ -66,13 +66,21 @@ WATCHLIST_PATH = Path(__file__).parent.parent / "data" / "watchlist.json"
 GROQ_SYSTEM = """Disciplined paper trading agent. $1000 account. Rules:
 - Long-only. Max $100/position (10%). Min $50 order value. Max 5 open. Keep $250+ cash.
 - Every BUY needs stop 3-10% below entry, take-profit ≥1.5× risk. No leveraged ETFs. No earnings within 3 days.
-- Fractional shares supported. qty=floor(100/entry_limit * 100)/100 (floor, not round — must stay ≤$100). If order value <$50 → NO TRADE.
-- Default to NO TRADE unless setup is specific and compelling.
+- Fractional shares: qty=floor(100/entry_limit * 100)/100 (floor, not round). If qty×entry_limit < $50 → NO TRADE.
+- Take-profit: 7-15% above entry for MEDIUM confidence, up to 20% for HIGH. Targets >20% will not fill in 1-20 days.
+
+HARD FILTERS — if any apply, output NO TRADE (not BUY):
+- RSI > 65: overbought. Do not chase.
+- No specific catalyst (news event, MA support test, volume breakout from consolidation base): not a trade.
+- Thesis is just "might go up" or "momentum": not enough. Name the trigger and the invalidation.
+- Stock extended above both MA20 and MA50 with RSI > 58 and no news: no edge, no entry.
+
+Most cycles should produce 0–1 BUY. If you are outputting BUY on 3+ candidates, you are overtrading — revisit.
 
 One JSON block per candidate (on its own line):
-{"action":"BUY","ticker":"X","qty":0.00,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"..."}
-{"action":"NO TRADE","ticker":"X","reason":"..."}
-Then a brief reflection."""
+{"action":"BUY","ticker":"X","qty":0.00,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"Catalyst: <what changed>. Entry: <specific trigger>. Breaks if: <invalidation>."}
+{"action":"NO TRADE","ticker":"X","reason":"<specific filter: RSI 67 overbought / no catalyst / extended above MAs>"}
+Then 1-2 sentence reflection on the session."""
 
 
 def load_system_prompt():
@@ -402,9 +410,9 @@ def _collect_market_data(top_n: int = 5) -> dict:
     universe = list(dict.fromkeys(priority_syms + screener_syms))[:20]
     print(f"  Universe ({len(universe)} candidates): {universe}")
 
-    # Pre-filter to top_n for deep analysis using screener scores.
-    # Score = abs(5d_change_pct) * vol_ratio. Priority tickers get a boost.
-    screener_scores = {m["symbol"]: abs(m.get("5d_change_pct", 0)) * m.get("vol_ratio", 1)
+    # Pre-filter to top_n for deep analysis using setup quality scores.
+    # setup_score ranks pullbacks/oversold/breakouts — not raw momentum chasers.
+    screener_scores = {m["symbol"]: m.get("setup_score", 0)
                        for m in all_movers}
     def score(sym):
         base = screener_scores.get(sym, 0)
@@ -463,17 +471,18 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
     spy = mkt.get("SPY", {})
     qqq = mkt.get("QQQ", {})
 
-    # Compact screener summary for all 20 (one line each)
+    # Compact screener summary — show RSI so LLM can immediately apply RSI>65 filter
     screener_summary = ", ".join(
-        f"{m['symbol']}({m['5d_change_pct']:+.1f}%,vol:{m['vol_ratio']:.1f}x)"
+        f"{m['symbol']}(RSI:{m['rsi14']},{m['5d_change_pct']:+.1f}%,vol:{m['vol_ratio']:.1f}x)"
         for m in data["all_movers"]
+        if m.get("rsi14") is not None
     )
 
-    # Compact technicals — omit fields already in screener summary (5d_change_pct, vol_ratio)
-    # and derivable ones (above_ma20 = price > ma20)
+    # Compact technicals — keep vol_ratio and above_ma20 (real signals, worth the tokens)
+    # drop 5d_change_pct (already in screener line) and raw volume counts
     compact_tech = {
         sym: {k: v for k, v in t.items() if k in
-              ("current_price", "ma20", "ma50", "rsi14")}
+              ("current_price", "ma20", "ma50", "rsi14", "vol_ratio", "above_ma20", "above_ma50")}
         for sym, t in data["technicals"].items()
         if "error" not in t
     }
@@ -501,14 +510,37 @@ For each of the 5 deep candidates output a JSON decision block, then a brief ref
             print(b["text"])
             response_text += b["text"]
 
-    # Try to extract and execute any BUY/SELL decisions from the response
+    # Execute orders and capture results for journal annotation
+    execution_results = {}
     if not dry_run and not premarket:
-        _execute_from_text(response_text, data["account"])
+        execution_results = _execute_from_text(response_text, data["account"])
 
-    # Write journal with structured decisions so the dashboard can parse them
+    # Write journal with decisions annotated with execution status
     try:
         decisions = _parse_decisions_from_text(response_text)
-        # Extract reflection (non-JSON text after the last decision block)
+
+        for d in decisions:
+            action = d.get("action", "")
+            ticker = d.get("ticker", "")
+            if action in ("BUY", "SELL"):
+                if dry_run:
+                    d["execution_status"] = "DRY_RUN"
+                elif premarket:
+                    d["execution_status"] = "NOT_SUBMITTED"
+                elif ticker in execution_results:
+                    res = execution_results[ticker]
+                    d["execution_status"] = res.get("status", "ERROR")
+                    if res.get("status") == "SUBMITTED":
+                        d["order_id"] = res.get("order_id")
+                    elif res.get("status") in ("REJECTED", "ERROR"):
+                        d["execution_detail"] = res.get("reason") or res.get("error")
+                else:
+                    d["execution_status"] = "NOT_SUBMITTED"
+            elif action == "NO TRADE":
+                d["execution_status"] = "NO_TRADE"
+            elif action == "HOLD":
+                d["execution_status"] = "HOLD"
+
         import re as _re
         reflection = _re.sub(r'\{[^{}]*"action"[^{}]*\}', '', response_text, flags=_re.DOTALL).strip()
         journal_module.write_entry({
@@ -540,16 +572,20 @@ def _parse_decisions_from_text(text: str) -> list:
     return decisions
 
 
-def _execute_from_text(text: str, account: dict):
-    """Parse and execute BUY/SELL decisions from LLM response text."""
+def _execute_from_text(text: str, account: dict) -> dict:
+    """Parse and execute BUY/SELL decisions. Returns {ticker: result} for journal annotation."""
     import math
+    results = {}
     for decision in _parse_decisions_from_text(text):
         action = decision.get("action", "")
         ticker = decision.get("ticker", "")
         if action == "BUY" and ticker:
-            # Floor to 2 decimal places — LLMs sometimes round up, pushing past the 10% limit
             raw_qty = float(decision.get("qty", 0))
+            entry = float(decision.get("entry_limit", decision.get("entry", 0)) or 0)
+            # Floor, then hard-cap at floor(100/entry*100)/100 — LLMs sometimes round up
             qty = math.floor(raw_qty * 100) / 100
+            if entry > 0:
+                qty = min(qty, math.floor((100.0 / entry) * 100) / 100)
             result = trade_module.place_buy(
                 ticker,
                 qty,
@@ -559,6 +595,7 @@ def _execute_from_text(text: str, account: dict):
                 decision.get("thesis", "agent decision")
             )
             print(f"\n→ ORDER: {json.dumps(result)}")
+            results[ticker] = result
         elif action == "SELL" and ticker:
             result = trade_module.place_sell(
                 ticker,
@@ -566,6 +603,75 @@ def _execute_from_text(text: str, account: dict):
                 decision.get("reason", "agent decision")
             )
             print(f"\n→ ORDER: {json.dumps(result)}")
+            results[ticker] = result
+    return results
+
+
+def _load_stop_levels() -> dict:
+    """
+    Read the most recent BUY decision for each symbol from journal history.
+    Returns {symbol: {"stop_loss": float, "take_profit": float, "entry": float}}.
+    Used to monitor fractional positions that have no automatic stop orders.
+    """
+    import glob
+    journal_dir = Path(__file__).parent.parent / "journal"
+    files = sorted(glob.glob(str(journal_dir / "*.json")), reverse=True)
+    stops = {}
+    for f in files[:30]:  # look back at most 30 entries
+        try:
+            with open(f) as fh:
+                entry = json.load(fh)
+            for d in entry.get("decisions", []):
+                sym = d.get("ticker", "")
+                if d.get("action") == "BUY" and d.get("execution_status") == "SUBMITTED" and sym not in stops:
+                    stops[sym] = {
+                        "stop_loss": d.get("stop_loss"),
+                        "take_profit": d.get("take_profit"),
+                        "entry": d.get("entry_limit"),
+                    }
+        except Exception:
+            continue
+    return stops
+
+
+def _check_fractional_stops(dry_run: bool = False):
+    """
+    For each open fractional position, compare current price to stop/target.
+    Exits the position if the stop is breached. Fractional orders have no
+    automatic stop orders in Alpaca, so this is manual enforcement.
+    """
+    try:
+        account = research.get_account()
+        positions = account.get("positions", [])
+        fractional = [p for p in positions if (float(p["qty"]) % 1) != 0]
+        if not fractional:
+            return
+
+        stop_levels = _load_stop_levels()
+        print(f"\n[Stop check] {len(fractional)} fractional position(s):")
+
+        for p in fractional:
+            sym = p["symbol"]
+            current = p.get("current_price") or p.get("avg_entry_price")
+            levels = stop_levels.get(sym, {})
+            stop = levels.get("stop_loss")
+            target = levels.get("take_profit")
+
+            stop_hit = stop and current and current <= stop
+            target_hit = target and current and current >= target
+
+            if stop_hit or target_hit:
+                reason = f"stop hit @ ${current} (stop ${stop})" if stop_hit else f"target hit @ ${current} (target ${target})"
+                print(f"  {sym}: {reason} — {'DRY RUN skip' if dry_run else 'SELLING'}")
+                if not dry_run:
+                    result = trade_module.place_sell(sym, float(p["qty"]), reason)
+                    print(f"  → {json.dumps(result)}")
+            else:
+                stop_str = f"stop ${stop}" if stop else "no stop recorded"
+                target_str = f"target ${target}" if target else "no target recorded"
+                print(f"  {sym}: ${current} — {stop_str} | {target_str} — HOLD")
+    except Exception as e:
+        print(f"[Stop check failed: {e}]")
 
 
 def run_cycle(dry_run: bool = False, premarket: bool = False):
@@ -577,6 +683,9 @@ def run_cycle(dry_run: bool = False, premarket: bool = False):
     print(f"Provider: {LLM_PROVIDER.upper()} / {MODEL}")
     print(f"Mode: {'DRY RUN' if dry_run else 'PREMARKET' if premarket else 'LIVE'}")
     print(f"{'='*60}\n")
+
+    if not premarket:
+        _check_fractional_stops(dry_run=dry_run)
 
     # Groq free tier: single-shot approach (no accumulating context)
     if LLM_PROVIDER != "anthropic":

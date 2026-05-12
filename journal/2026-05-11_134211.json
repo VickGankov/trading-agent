@@ -1,0 +1,121 @@
+{
+  "cycle_timestamp": "2026-05-11T13:42:11.598479",
+  "provider": "groq/llama-3.3-70b-versatile",
+  "account": {
+    "account_value": 1000.0,
+    "cash": 1000.0,
+    "buying_power": 1000.0,
+    "daytrade_count": 0,
+    "pattern_day_trader": false,
+    "trading_blocked": false,
+    "account_blocked": false,
+    "positions_count": 0,
+    "positions": [],
+    "is_paper": true
+  },
+  "market_context": {
+    "indices": {
+      "SPY": {
+        "price": 676.01,
+        "5d_change_pct": 3.95,
+        "20d_change_pct": -0.17,
+        "above_ma20": true,
+        "rsi14": 57.7
+      },
+      "QQQ": {
+        "price": 606.09,
+        "5d_change_pct": 5.01,
+        "20d_change_pct": -0.28,
+        "above_ma20": true,
+        "rsi14": 55.4
+      },
+      "IWM": {
+        "price": 260.47,
+        "5d_change_pct": 5.03,
+        "20d_change_pct": 2.81,
+        "above_ma20": true,
+        "rsi14": 64.5
+      }
+    },
+    "market_status": {
+      "is_open": true,
+      "next_open": "2026-05-12T09:30:00-04:00",
+      "next_close": "2026-05-11T16:00:00-04:00",
+      "current_time": "2026-05-11T14:42:06.249314-04:00"
+    }
+  },
+  "screener_universe": [
+    "AVGO",
+    "AMD",
+    "PANW",
+    "META",
+    "CRWD",
+    "GOOGL",
+    "SMH",
+    "OXY",
+    "C",
+    "XOM",
+    "TSLA",
+    "GS",
+    "XLE",
+    "AMZN",
+    "CVX",
+    "MS",
+    "PLTR",
+    "BAC",
+    "XLK",
+    "QQQ"
+  ],
+  "deep_candidates": [
+    "AVGO",
+    "AMD",
+    "META",
+    "CRWD",
+    "GOOGL"
+  ],
+  "decisions": [
+    {
+      "action": "BUY",
+      "ticker": "AVGO",
+      "qty": 0.29,
+      "entry_limit": 350.63,
+      "stop_loss": 335.71,
+      "take_profit": 401.19,
+      "confidence": "MEDIUM",
+      "thesis": "AVGO has strong momentum and is part of the 'AI Chip Trade' trend, with a recent increase in price and a high RSI14 value. The stop loss is set at 3-10% below the entry limit, and the take profit is set at 1.5 times the risk."
+    },
+    {
+      "action": "BUY",
+      "ticker": "AMD",
+      "qty": 0.43,
+      "entry_limit": 231.82,
+      "stop_loss": 221.35,
+      "take_profit": 264.29,
+      "confidence": "MEDIUM",
+      "thesis": "AMD is also part of the 'AI Chip Trade' trend and has recently hit a 52-week high. The stock has a high RSI14 value, and the stop loss is set at 3-10% below the entry limit, with a take profit at 1.5 times the risk."
+    },
+    {
+      "action": "NO TRADE",
+      "ticker": "META",
+      "reason": "META has a low RSI14 value and recent news about a lawsuit, which may negatively impact the stock price."
+    },
+    {
+      "action": "NO TRADE",
+      "ticker": "CRWD",
+      "reason": "CRWD has a low RSI14 value and lacks recent significant news or trends that would make it a compelling buy."
+    },
+    {
+      "action": "BUY",
+      "ticker": "GOOGL",
+      "qty": 0.31,
+      "entry_limit": 317.32,
+      "stop_loss": 304.41,
+      "take_profit": 363.99,
+      "confidence": "MEDIUM",
+      "thesis": "GOOGL has a strong trend and recent news about the rollout of end-to-end encrypted RCS messaging. The stop loss is set at 3-10% below the entry limit, and the take profit is set at 1.5 times the risk."
+    }
+  ],
+  "reflection": "The decisions are based on a combination of technical analysis, news, and trends. AVGO and AMD are part of the 'AI Chip Trade' trend and have strong momentum, making them potential buys. GOOGL has a strong trend and recent positive news, also making it a potential buy. META and CRWD lack significant trends or news, and their low RSI14 values make them less compelling buys. The stop losses and take profits are set based on the rules, with a 3-10% stop loss below the entry limit and a take profit ",
+  "dry_run": false,
+  "_written_at": "2026-05-11T13:42:11.598582"
+}

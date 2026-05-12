@@ -1,0 +1,126 @@
+{
+  "cycle_timestamp": "2026-05-11T13:39:11.725023",
+  "provider": "groq/llama-3.3-70b-versatile",
+  "account": {
+    "account_value": 1000.0,
+    "cash": 1000.0,
+    "buying_power": 1000.0,
+    "daytrade_count": 0,
+    "pattern_day_trader": false,
+    "trading_blocked": false,
+    "account_blocked": false,
+    "positions_count": 0,
+    "positions": [],
+    "is_paper": true
+  },
+  "market_context": {
+    "indices": {
+      "SPY": {
+        "price": 676.01,
+        "5d_change_pct": 3.95,
+        "20d_change_pct": -0.17,
+        "above_ma20": true,
+        "rsi14": 57.7
+      },
+      "QQQ": {
+        "price": 606.09,
+        "5d_change_pct": 5.01,
+        "20d_change_pct": -0.28,
+        "above_ma20": true,
+        "rsi14": 55.4
+      },
+      "IWM": {
+        "price": 260.47,
+        "5d_change_pct": 5.03,
+        "20d_change_pct": 2.81,
+        "above_ma20": true,
+        "rsi14": 64.5
+      }
+    },
+    "market_status": {
+      "is_open": true,
+      "next_open": "2026-05-12T09:30:00-04:00",
+      "next_close": "2026-05-11T16:00:00-04:00",
+      "current_time": "2026-05-11T14:39:05.908303-04:00"
+    }
+  },
+  "screener_universe": [
+    "AVGO",
+    "AMD",
+    "PANW",
+    "META",
+    "CRWD",
+    "GOOGL",
+    "SMH",
+    "OXY",
+    "C",
+    "XOM",
+    "TSLA",
+    "GS",
+    "XLE",
+    "AMZN",
+    "CVX",
+    "MS",
+    "PLTR",
+    "BAC",
+    "XLK",
+    "QQQ"
+  ],
+  "deep_candidates": [
+    "AVGO",
+    "AMD",
+    "META",
+    "CRWD",
+    "GOOGL"
+  ],
+  "decisions": [
+    {
+      "action": "BUY",
+      "ticker": "AVGO",
+      "qty": 0.29,
+      "entry_limit": 350.63,
+      "stop_loss": 335.41,
+      "take_profit": 408.85,
+      "confidence": "MEDIUM",
+      "thesis": "AVGO has strong momentum with a 13.3% increase in price and a high RSI of 65.4, indicating potential for continued growth."
+    },
+    {
+      "action": "BUY",
+      "ticker": "AMD",
+      "qty": 0.43,
+      "entry_limit": 231.82,
+      "stop_loss": 220.67,
+      "take_profit": 334.19,
+      "confidence": "MEDIUM",
+      "thesis": "AMD has significant momentum with a 14.0% increase in price and a high RSI of 68.2, indicating potential for continued growth."
+    },
+    {
+      "action": "BUY",
+      "ticker": "CRWD",
+      "qty": 0.23,
+      "entry_limit": 426.51,
+      "stop_loss": 407.43,
+      "take_profit": 630.79,
+      "confidence": "MEDIUM",
+      "thesis": "CRWD has strong momentum with a 9.2% increase in price and a moderate RSI of 46.8, indicating potential for continued growth."
+    },
+    {
+      "action": "BUY",
+      "ticker": "GOOGL",
+      "qty": 0.32,
+      "entry_limit": 317.32,
+      "stop_loss": 303.11,
+      "take_profit": 466.29,
+      "confidence": "MEDIUM",
+      "thesis": "GOOGL has moderate momentum with a 10.3% increase in price and a moderate RSI of 55.7, indicating potential for continued growth."
+    },
+    {
+      "action": "NO TRADE",
+      "ticker": "META",
+      "reason": "META has a relatively low RSI of 49.2 and mixed news, making it a less compelling candidate for a trade."
+    }
+  ],
+  "reflection": "Brief reflection: \nThe top 5 candidates have shown significant momentum, with AVGO, AMD, and CRWD having the most compelling setups. GOOGL also shows promise, but with a more moderate RSI. However, META's relatively low RSI and mixed news make it a less attractive trade. Given the strong momentum in the market, it may be wise to consider trades with stop losses and take profits to manage risk. It's also essential to continue monitoring the news and technicals for any changes that could impact th",
+  "dry_run": true,
+  "_written_at": "2026-05-11T13:39:11.725056"
+}

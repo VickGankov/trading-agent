@@ -217,13 +217,19 @@ Alpaca error 42210000: bracket orders reject fractional qty. Workaround in `plac
 **Implication:** fractional positions need manual stop monitoring each cycle. The agent should check open fractional positions against their stated stop levels on each cycle and call `place_sell()` if breached.
 
 ### Known Gaps (prioritized)
-1. **Fractional stop monitoring** — agent doesn't yet check fractional positions against stop levels each cycle. Needs a `check_fractional_stops()` call in `run_cycle()` that reads open positions + their stop prices from the journal and exits if breached.
-2. **Earnings calendar is hardcoded** — `check_earnings_calendar()` in research.py uses a static dict. Needs `yfinance` or Finnhub for live data.
-3. **Screener uses static universe** — `screener_movers()` fetches technicals on a hardcoded list, not a real-time most-active feed.
-4. **Anthropic provider not configured** — `ANTHROPIC_API_KEY` is placeholder. Anthropic path uses full tool-use loop with CLAUDE.md as system prompt + prompt caching (not yet added — add `cache_control` to system prompt for ~90% input token savings on repeated turns).
-5. **Trade P&L ledger** — no win/loss tracking yet. Build once positions start closing.
+1. **Anthropic provider not configured** — `ANTHROPIC_API_KEY` is placeholder. Anthropic path uses full tool-use loop with CLAUDE.md as system prompt + prompt caching (not yet added — add `cache_control` to system prompt for ~90% input token savings on repeated turns).
+2. **Trade P&L ledger** — no win/loss tracking yet. Build once positions start closing.
+3. **Screener universe is static** — `screener_movers()` scans a hardcoded ~50-stock list, not a real-time most-active feed. Finnhub or Polygon integration would expand coverage.
+4. **Dashboard buy count** — counts all LLM BUY decisions regardless of `execution_status`. Now that journal records `execution_status`, dashboard should filter to `status=="SUBMITTED"` only.
 
-### Current Account State (as of 2026-05-11)
+### Completed Fixes (2026-05-12)
+- Fractional stop monitoring: `_check_fractional_stops()` runs at top of each cycle, sells if stop/target breached
+- Execution status in journal: every decision now has `execution_status` (SUBMITTED/REJECTED/DRY_RUN/NOT_SUBMITTED/NO_TRADE/HOLD) + `order_id` or `execution_detail`
+- GROQ_SYSTEM tightened: RSI>65 hard block, requires catalyst/trigger/invalidation in thesis, "0-1 BUY most cycles" target
+- Live earnings calendar: `check_earnings_calendar()` uses yfinance (replaces static 5-stock dict)
+- Setup-quality screener: `screener_movers()` ranks by pullback/oversold/breakout quality not momentum; RSI visible in screener summary sent to LLM
+
+### Current Account State (as of 2026-05-12)
 - Paper account: $1,000 starting capital
-- Active orders: AMD 0.43sh @ $231.82 limit, CRWD 0.23sh @ $426.51 limit (DAY orders — may have expired at close)
-- Week start equity: $1,000 (2026-W19, tracked in data/state.json)
+- Prior DAY orders (AMD 0.43sh, CRWD 0.23sh) expired unfilled at close on 2026-05-08
+- Week start equity: $1,000 (2026-W20, tracked in data/state.json)

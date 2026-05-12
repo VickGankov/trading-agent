@@ -246,81 +246,145 @@ def get_market_snapshot():
     }
 
 
+def _setup_score(tech: dict) -> float:
+    """
+    Score a stock on setup quality for entry, NOT recent price momentum.
+    Looks for pullbacks to MA support, oversold bounces, and volume breakouts
+    from consolidation. Returns 0 for explicitly disqualified setups (overbought,
+    huge gap-and-run). Higher score = better candidate for deep analysis.
+    """
+    rsi = tech.get("rsi14") or 50.0
+    price = tech.get("current_price") or 0.0
+    ma20 = tech.get("ma20") or price
+    ma50 = tech.get("ma50") or price
+    vol_ratio = tech.get("vol_ratio") or 1.0
+    change_5d = tech.get("5d_change_pct") or 0.0
+    above_ma20 = tech.get("above_ma20")
+
+    # Hard disqualifiers — skip these entirely
+    if rsi > 65:
+        return 0.0
+    if abs(change_5d) > 20:  # massive gap move; thesis already played out
+        return 0.0
+
+    score = 0.0
+    above_ma50 = price > ma50 if ma50 else False
+
+    # Setup 1: pullback to MA20 in an uptrend
+    # Best when price is 0-3% above MA20, RSI has cooled to 38-58
+    if above_ma20 and ma20:
+        pct_above_ma20 = ((price - ma20) / ma20) * 100
+        if 0 <= pct_above_ma20 <= 4 and 38 <= rsi <= 58:
+            score += 10.0 - (pct_above_ma20 * 1.5)  # tighter to MA = better
+
+    # Setup 2: oversold with uptrend structure intact (MA50 support)
+    if rsi < 42 and above_ma50:
+        score += 7.0 + (42 - rsi) * 0.25  # more oversold but still above MA50 = better
+
+    # Setup 3: volume breakout from consolidation (high vol, small recent price move)
+    # Distinguishes early-stage breakouts from already-extended momentum plays
+    if vol_ratio >= 2.0 and abs(change_5d) < 5:
+        score += vol_ratio * 2.5
+
+    # Minor bonus for stocks in established uptrend (above MA50)
+    if above_ma50:
+        score += 1.0
+
+    # Decay score for stocks that are already extended — less favorable entry
+    if abs(change_5d) > 7:
+        decay = min(0.8, (abs(change_5d) - 7) * 0.07)
+        score *= (1.0 - decay)
+
+    return round(score, 2)
+
+
 def screener_movers():
     """
-    Get most active stocks. Note: Alpaca doesn't have a built-in 'top movers' endpoint
-    on the free tier — we use the Most Active list as a proxy.
-    For richer screening, integrate a free API like Finnhub or polygon (not included here).
+    Screen for stocks with actionable setups: pullbacks to MA, oversold bounces,
+    volume breakouts from consolidation. Ranked by setup quality, NOT raw momentum.
     """
-    # Use a static list of high-volume names + the watchlist universe as starting universe
     universe = [
         "AAPL", "MSFT", "GOOGL", "AMZN", "META", "NVDA", "TSLA", "AMD", "AVGO",
-        "PLTR", "COIN", "MSTR", "SMCI", "CRWD", "ZS", "PANW", "FTNT",
+        "PLTR", "COIN", "SMCI", "CRWD", "ZS", "PANW", "FTNT",
         "JPM", "BAC", "GS", "MS", "C",
         "XOM", "CVX", "OXY",
         "CEG", "VST", "NEE",
-        "SPY", "QQQ", "IWM", "SMH", "XLK", "XLF", "XLE",
+        "SMH", "XLK", "XLF", "XLE",
         "DIS", "NFLX", "UBER", "SHOP", "SQ",
         "BA", "LMT", "RTX", "GE",
-        "WMT", "COST", "TGT", "HD", "LOW",
-        "MCD", "SBUX", "CMG",
-        "JNJ", "PFE", "MRK", "LLY", "UNH",
+        "WMT", "COST", "TGT", "HD",
+        "MCD", "SBUX",
+        "JNJ", "PFE", "LLY", "UNH",
         "KO", "PEP", "PG"
     ]
-    
-    movers = []
-    for symbol in universe[:40]:  # cap to control API calls
+
+    candidates = []
+    for symbol in universe[:50]:
         try:
             tech = calc_technicals(symbol)
-            if "error" not in tech and tech.get("vol_ratio") and tech.get("5d_change_pct") is not None:
-                movers.append({
-                    "symbol": symbol,
-                    "price": tech["current_price"],
-                    "5d_change_pct": tech["5d_change_pct"],
-                    "vol_ratio": tech["vol_ratio"],
-                    "rsi14": tech["rsi14"]
-                })
+            if "error" in tech or tech.get("vol_ratio") is None:
+                continue
+            candidates.append({
+                "symbol": symbol,
+                "price": tech["current_price"],
+                "5d_change_pct": tech["5d_change_pct"],
+                "vol_ratio": tech["vol_ratio"],
+                "rsi14": tech["rsi14"],
+                "above_ma20": tech["above_ma20"],
+                "setup_score": _setup_score(tech),
+            })
         except Exception:
             continue
-    
-    # Sort by absolute 5d change × volume ratio
-    movers.sort(key=lambda x: abs(x["5d_change_pct"] or 0) * (x["vol_ratio"] or 0), reverse=True)
-    return {"movers": movers[:20]}
+
+    candidates.sort(key=lambda x: x["setup_score"], reverse=True)
+    return {"movers": candidates[:20]}
 
 
 def check_earnings_calendar(symbols: str):
     """
-    Check upcoming earnings. Alpaca doesn't have a built-in earnings calendar in free tier.
-    For production, integrate a free source like Yahoo Finance via yfinance, Finnhub, or NASDAQ.
-    This is a placeholder that returns warnings for known dates.
+    Check upcoming earnings via yfinance. Returns avoid_new_positions=True
+    if earnings are within the next 3 trading days.
     """
-    known_earnings = {
-        "NVDA": "2026-05-20",
-        "CEG": "2026-05-11",
-        "VST": "2026-05-07",
-        "PLTR": "2026-08-03",
-        "MAIN": "2026-05-08"
-    }
-    
+    try:
+        import yfinance as yf
+    except ImportError:
+        return {"error": "yfinance not installed — run: pip install yfinance"}
+
     today = datetime.now().date()
     results = []
     for sym in symbols.split(","):
         sym = sym.strip().upper()
-        if sym in known_earnings:
-            earn_date = datetime.strptime(known_earnings[sym], "%Y-%m-%d").date()
-            days_until = (earn_date - today).days
-            results.append({
-                "symbol": sym,
-                "earnings_date": known_earnings[sym],
-                "days_until": days_until,
-                "avoid_new_positions": -1 <= days_until <= 3
-            })
-        else:
-            results.append({
-                "symbol": sym,
-                "earnings_date": "unknown",
-                "note": "Integrate yfinance or Finnhub for live calendar"
-            })
+        if not sym:
+            continue
+        try:
+            ticker = yf.Ticker(sym)
+            cal = ticker.calendar  # dict with keys like 'Earnings Date'
+            earn_date = None
+
+            if isinstance(cal, dict):
+                raw = cal.get("Earnings Date")
+                if raw is not None:
+                    # yfinance returns a list of timestamps or a single timestamp
+                    if hasattr(raw, "__iter__") and not isinstance(raw, str):
+                        dates = [d.date() if hasattr(d, "date") else d for d in raw]
+                        future = [d for d in dates if d >= today]
+                        earn_date = min(future) if future else (max(dates) if dates else None)
+                    elif hasattr(raw, "date"):
+                        earn_date = raw.date()
+
+            if earn_date:
+                days_until = (earn_date - today).days
+                results.append({
+                    "symbol": sym,
+                    "earnings_date": earn_date.isoformat(),
+                    "days_until": days_until,
+                    "avoid_new_positions": -1 <= days_until <= 3
+                })
+            else:
+                results.append({"symbol": sym, "earnings_date": "unknown", "avoid_new_positions": False})
+        except Exception as e:
+            results.append({"symbol": sym, "earnings_date": "unknown", "avoid_new_positions": False, "note": str(e)})
+
     return {"earnings_check": results}
 
 
