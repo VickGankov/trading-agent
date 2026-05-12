@@ -63,24 +63,28 @@ CLAUDE_MD = Path(__file__).parent.parent / "CLAUDE.md"
 WATCHLIST_PATH = Path(__file__).parent.parent / "data" / "watchlist.json"
 
 # Condensed system prompt for Groq (stays under 12K TPM free tier limit)
-GROQ_SYSTEM = """Disciplined paper trading agent. $1000 account. Rules:
-- Long-only. Max $100/position (10%). Min $50 order value. Max 5 open. Keep $250+ cash.
-- Every BUY needs stop 3-10% below entry, take-profit ≥1.5× risk. No leveraged ETFs. No earnings within 3 days.
-- Fractional shares: qty=floor(100/entry_limit * 100)/100 (floor, not round). If qty×entry_limit < $50 → NO TRADE.
-- Take-profit: 7-15% above entry for MEDIUM confidence, up to 20% for HIGH. Targets >20% will not fill in 1-20 days.
+GROQ_SYSTEM = """Disciplined paper trading agent. $1000 account.
+Rules: long-only, max $100/position (10%), min $50 order, max 5 open, keep $250+ cash.
+Every BUY: stop 4-6% below entry_limit, target 8-12% above entry_limit. No leveraged ETFs.
 
-HARD FILTERS — if any apply, output NO TRADE (not BUY):
-- RSI > 65: overbought. Do not chase.
-- No specific catalyst (news event, MA support test, volume breakout from consolidation base): not a trade.
-- Thesis is just "might go up" or "momentum": not enough. Name the trigger and the invalidation.
-- Stock extended above both MA20 and MA50 with RSI > 58 and no news: no edge, no entry.
+entry_limit MUST be current_price + 0.3% (round to 2 decimals). Never set below current_price — it will expire unfilled.
+Fractional qty: floor(100 / entry_limit * 100) / 100. Verify qty × entry_limit ≥ $50.
 
-Most cycles should produce 0–1 BUY. If you are outputting BUY on 3+ candidates, you are overtrading — revisit.
+OUTPUT BUY when one setup applies and no rejection fires:
+  A. MA20 PULLBACK — price within 4% above MA20, RSI 38-60, above MA50. No news required.
+  B. OVERSOLD BOUNCE — RSI < 42, above MA50. No news required.
+  C. NEWS CATALYST — analyst upgrade/PT raise, earnings beat, product launch + above MA50, any RSI ≤ 65.
 
-One JSON block per candidate (on its own line):
-{"action":"BUY","ticker":"X","qty":0.00,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"Catalyst: <what changed>. Entry: <specific trigger>. Breaks if: <invalidation>."}
-{"action":"NO TRADE","ticker":"X","reason":"<specific filter: RSI 67 overbought / no catalyst / extended above MAs>"}
-Then 1-2 sentence reflection on the session."""
+REJECT (these override any setup):
+  - RSI > 65 (overbought)
+  - Earnings ≤ 3 days away
+  - Below MA50 (downtrend — no catching falling knives)
+
+If a setup matches and no rejection fires → lean BUY. Do not invent extra reasons to pass.
+
+One JSON per candidate, then 1-sentence reflection:
+{"action":"BUY","ticker":"X","qty":0.00,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"Setup [A/B/C]: <one sentence why>."}
+{"action":"NO TRADE","ticker":"X","reason":"<exact rejection rule: RSI 67 / earnings 2d / below MA50>"}"""
 
 
 def load_system_prompt():
@@ -461,7 +465,7 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
     parse decisions, execute orders. Stays within free-tier token limits.
     """
     print("\nCollecting market data...")
-    data = _collect_market_data(top_n=5)  # screener gets 20, deep analysis on top 5
+    data = _collect_market_data(top_n=7)  # screener gets 20, deep analysis on top 7
 
     mode_note = "DRY RUN - analyze only, no orders." if dry_run else (
                 "PRE-MARKET - plan only, no orders." if premarket else "")
@@ -482,7 +486,8 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
     # drop 5d_change_pct (already in screener line) and raw volume counts
     compact_tech = {
         sym: {k: v for k, v in t.items() if k in
-              ("current_price", "ma20", "ma50", "rsi14", "vol_ratio", "above_ma20", "above_ma50")}
+              ("current_price", "ma20", "ma50", "rsi14", "vol_ratio",
+               "above_ma20", "above_ma50", "5d_change_pct")}
         for sym, t in data["technicals"].items()
         if "error" not in t
     }

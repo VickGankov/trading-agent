@@ -357,8 +357,11 @@ def check_earnings_calendar(symbols: str):
         if not sym:
             continue
         try:
-            ticker = yf.Ticker(sym)
-            cal = ticker.calendar  # dict with keys like 'Earnings Date'
+            import warnings
+            with warnings.catch_warnings():
+                warnings.simplefilter("ignore")
+                ticker = yf.Ticker(sym)
+                cal = ticker.calendar  # dict with keys like 'Earnings Date'
             earn_date = None
 
             if isinstance(cal, dict):
