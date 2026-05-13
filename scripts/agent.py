@@ -410,9 +410,14 @@ def _collect_market_data(top_n: int = 5) -> dict:
     priority_syms = [t["symbol"] for t in watchlist.get("priority_tickers", [])]
     screener_syms = [m["symbol"] for m in all_movers]
 
-    # Merge priority + screener, dedupe, cap at 20
-    universe = list(dict.fromkeys(priority_syms + screener_syms))[:20]
-    print(f"  Universe ({len(universe)} candidates): {universe}")
+    # Exclude symbols with open positions — never average down or buy more of a held stock
+    open_symbols = {p["symbol"] for p in account.get("positions", [])}
+
+    # Merge priority + screener, dedupe, exclude held, cap at 20
+    universe = list(dict.fromkeys(
+        s for s in (priority_syms + screener_syms) if s not in open_symbols
+    ))[:20]
+    print(f"  Universe ({len(universe)} candidates, excluding held: {open_symbols or 'none'}): {universe}")
 
     # Pre-filter to top_n for deep analysis using setup quality scores.
     # setup_score ranks pullbacks/oversold/breakouts — not raw momentum chasers.
@@ -493,31 +498,34 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
         if m.get("rsi14") is not None
     )
 
-    # Pre-classify each deep candidate's setup in Python — eliminates LLM arithmetic errors
-    # and ensures consistent setup identification regardless of model reasoning quality.
-    def classify_setup(sym: str, t: dict, news_headlines: list) -> str:
-        rsi = t.get("rsi14") or 50.0
-        price = t.get("current_price") or 0.0
-        ma20 = t.get("ma20") or price
-        ma50 = t.get("ma50") or price
-        above_ma50 = t.get("above_ma50", price > ma50)
+    # Pre-classify each deep candidate's setup in Python using live price.
+    # Uses live ask so MA/RSI checks reflect today's market, not yesterday's close.
+    # Pre-computes entry/stop/target so the LLM just copies numbers, no arithmetic needed.
+    import math as _math
 
-        # Hard rejection checks
+    def classify_setup(live_price: float, t: dict, news_headlines: list) -> str:
+        rsi  = t.get("rsi14") or 50.0
+        ma20 = t.get("ma20") or live_price
+        ma50 = t.get("ma50") or live_price
+
         if rsi > 65:
-            return "REJECT: RSI>65 overbought"
-        if not above_ma50:
-            return "REJECT: below MA50 (downtrend)"
+            return "REJECT:RSI>65"
+        if live_price < ma50:
+            return "REJECT:belowMA50"
 
-        pct_above_ma20 = ((price - ma20) / ma20 * 100) if ma20 else 0
-        has_news = bool(news_headlines)
+        pct_above_ma20 = ((live_price - ma20) / ma20 * 100) if ma20 else 0
+        has_strong_news = any(
+            kw in h.lower() for h in news_headlines
+            for kw in ("upgrade", "raises price target", "beat", "launch", "contract", "raises pt")
+        )
 
         setups = []
         if 0 <= pct_above_ma20 <= 4 and 38 <= rsi <= 60:
-            setups.append(f"A-MA20pull({pct_above_ma20:+.1f}%aboveMA20)")
+            setups.append(f"A({pct_above_ma20:+.1f}%abvMA20)")
         if rsi < 42:
-            setups.append("B-oversold")
-        if has_news and rsi <= 65:
-            setups.append("C-newscatalyst")
+            setups.append("B(oversold)")
+        if has_strong_news:
+            setups.append("C(news)")
 
         return "/".join(setups) if setups else "NO_SETUP"
 
@@ -526,24 +534,37 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
         t = data["technicals"].get(sym, {})
         if "error" in t:
             continue
-        earn = data["earnings"].get(sym, {})
-        earn_days = earn.get("days_until")
-        earn_str = f"EARNINGS {earn_days}d" if isinstance(earn_days, int) and earn_days <= 7 else ""
-        setup = classify_setup(sym, t, data["news"].get(sym, []))
-        price = t.get("current_price", 0)
-        # Use live ask if available — guarantees same-day fill at or near current market
         quote = data.get("quotes", {}).get(sym, {})
-        ask = quote.get("ask") if quote.get("ask") and quote["ask"] > 0 else None
-        entry_suggest = round(ask * 1.001, 2) if ask else round(price * 1.003, 2)
+        ask   = quote.get("ask") if quote.get("ask", 0) > 0 else None
+        # live_price: use ask if available, fall back to technicals close
+        live_price = ask if ask else (t.get("current_price") or 0.0)
+        if live_price <= 0:
+            continue
+
+        earn      = data["earnings"].get(sym, {})
+        earn_days = earn.get("days_until")
+        earn_flag = f"⚠EARNINGS{earn_days}d" if isinstance(earn_days, int) and earn_days <= 3 else ""
+
+        setup = classify_setup(live_price, t, data["news"].get(sym, []))
+
+        # Pre-compute order parameters — LLM copies these exactly, no arithmetic
+        entry  = round(live_price * 1.001, 2)         # ask + 0.1% to cross spread
+        stop   = round(entry * 0.950, 2)               # 5% stop
+        target = round(entry * 1.100, 2)               # 10% target
+        qty    = _math.floor((100.0 / entry) * 100) / 100  # max $100 position, floored
+
+        action_hint = "→ BUY" if (setup not in ("NO_SETUP",) and not setup.startswith("REJECT") and not earn_flag) else "→ NO TRADE"
+
         row = (
-            f"{sym}: ${price} MA20=${t.get('ma20')} MA50=${t.get('ma50')} "
-            f"RSI={t.get('rsi14')} 5d={t.get('5d_change_pct'):+.1f}% "
-            f"| SETUP={setup} | entry_suggest=${entry_suggest}"
+            f"{sym} [{action_hint}] SETUP={setup}"
+            f" | MA20=${t.get('ma20')} MA50=${t.get('ma50')} RSI={t.get('rsi14')} 5d={t.get('5d_change_pct',0):+.1f}%"
+            f" | USE: entry={entry} stop={stop} target={target} qty={qty}"
         )
-        if earn_str:
-            row += f" | {earn_str}"
-        if data["news"].get(sym):
-            row += f" | NEWS: {'; '.join(data['news'][sym][:2])}"
+        if earn_flag:
+            row += f" | {earn_flag}"
+        headlines = data["news"].get(sym, [])
+        if headlines:
+            row += f" | news: {'; '.join(headlines[:2])}"
         candidate_rows.append(row)
 
     candidates_block = "\n".join(candidate_rows)
@@ -554,12 +575,14 @@ Market: open={data['clock']['is_open']} | SPY 5d:{spy.get('5d_change_pct',0):+.1
 
 SCREENER (top 20): {screener_summary}
 
-DEEP CANDIDATES — setup pre-classified, entry_suggest already +0.3%:
+DEEP CANDIDATES (entry/stop/target/qty pre-calculated from live price — copy exactly):
 {candidates_block}
 
-Rules: If SETUP is A/B/C and no REJECT/EARNINGS block → output BUY using entry_suggest as entry_limit.
-If SETUP=REJECT or NO_SETUP → output NO TRADE with the rejection reason.
-For each candidate output one JSON decision block, then 1-sentence reflection."""
+Instructions:
+- "→ BUY": copy entry/stop/target/qty exactly into the JSON. Do not recalculate.
+- "→ NO TRADE": output NO TRADE with the SETUP or EARNINGS reason shown.
+- If ⚠EARNINGS within 3 days: NO TRADE regardless of setup.
+Output one JSON per candidate, then one-sentence reflection."""
 
     print("\nAsking LLM for decisions...")
     messages = [{"role": "user", "content": prompt}]
