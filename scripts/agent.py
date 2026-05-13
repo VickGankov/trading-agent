@@ -446,16 +446,27 @@ def _collect_market_data(top_n: int = 5) -> dict:
     except Exception:
         pass
 
+    print("  Fetching live quotes for deep candidates...")
+    quotes = {}
+    for sym in deep_candidates:
+        try:
+            q = research.get_quote(sym)
+            if "error" not in q:
+                quotes[sym] = q
+        except Exception:
+            pass
+
     return {
         "account": account,
         "pdt": pdt,
         "market": market,
         "clock": clock,
         "all_movers": all_movers,          # full 20 for display
-        "deep_candidates": deep_candidates, # top 5 for LLM analysis
+        "deep_candidates": deep_candidates, # top 7 for LLM analysis
         "technicals": technicals,
         "news": news,
         "earnings": earnings,
+        "quotes": quotes,
     }
 
 
@@ -482,28 +493,73 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
         if m.get("rsi14") is not None
     )
 
-    # Compact technicals — keep vol_ratio and above_ma20 (real signals, worth the tokens)
-    # drop 5d_change_pct (already in screener line) and raw volume counts
-    compact_tech = {
-        sym: {k: v for k, v in t.items() if k in
-              ("current_price", "ma20", "ma50", "rsi14", "vol_ratio",
-               "above_ma20", "above_ma50", "5d_change_pct")}
-        for sym, t in data["technicals"].items()
-        if "error" not in t
-    }
+    # Pre-classify each deep candidate's setup in Python — eliminates LLM arithmetic errors
+    # and ensures consistent setup identification regardless of model reasoning quality.
+    def classify_setup(sym: str, t: dict, news_headlines: list) -> str:
+        rsi = t.get("rsi14") or 50.0
+        price = t.get("current_price") or 0.0
+        ma20 = t.get("ma20") or price
+        ma50 = t.get("ma50") or price
+        above_ma50 = t.get("above_ma50", price > ma50)
+
+        # Hard rejection checks
+        if rsi > 65:
+            return "REJECT: RSI>65 overbought"
+        if not above_ma50:
+            return "REJECT: below MA50 (downtrend)"
+
+        pct_above_ma20 = ((price - ma20) / ma20 * 100) if ma20 else 0
+        has_news = bool(news_headlines)
+
+        setups = []
+        if 0 <= pct_above_ma20 <= 4 and 38 <= rsi <= 60:
+            setups.append(f"A-MA20pull({pct_above_ma20:+.1f}%aboveMA20)")
+        if rsi < 42:
+            setups.append("B-oversold")
+        if has_news and rsi <= 65:
+            setups.append("C-newscatalyst")
+
+        return "/".join(setups) if setups else "NO_SETUP"
+
+    candidate_rows = []
+    for sym in data["deep_candidates"]:
+        t = data["technicals"].get(sym, {})
+        if "error" in t:
+            continue
+        earn = data["earnings"].get(sym, {})
+        earn_days = earn.get("days_until")
+        earn_str = f"EARNINGS {earn_days}d" if isinstance(earn_days, int) and earn_days <= 7 else ""
+        setup = classify_setup(sym, t, data["news"].get(sym, []))
+        price = t.get("current_price", 0)
+        # Use live ask if available — guarantees same-day fill at or near current market
+        quote = data.get("quotes", {}).get(sym, {})
+        ask = quote.get("ask") if quote.get("ask") and quote["ask"] > 0 else None
+        entry_suggest = round(ask * 1.001, 2) if ask else round(price * 1.003, 2)
+        row = (
+            f"{sym}: ${price} MA20=${t.get('ma20')} MA50=${t.get('ma50')} "
+            f"RSI={t.get('rsi14')} 5d={t.get('5d_change_pct'):+.1f}% "
+            f"| SETUP={setup} | entry_suggest=${entry_suggest}"
+        )
+        if earn_str:
+            row += f" | {earn_str}"
+        if data["news"].get(sym):
+            row += f" | NEWS: {'; '.join(data['news'][sym][:2])}"
+        candidate_rows.append(row)
+
+    candidates_block = "\n".join(candidate_rows)
 
     prompt = f"""Date: {datetime.now().strftime('%Y-%m-%d %H:%M ET')} {mode_note}
 Account: ${acct['account_value']:.0f} total, ${acct['cash']:.0f} cash, {acct['positions_count']}/5 positions, {data['pdt']['daytrade_count_5days']}/3 day trades
 Market: open={data['clock']['is_open']} | SPY 5d:{spy.get('5d_change_pct',0):+.1f}% RSI:{spy.get('rsi14','?')} | QQQ 5d:{qqq.get('5d_change_pct',0):+.1f}% RSI:{qqq.get('rsi14','?')}
 
-SCREENER (top 20 by momentum×volume): {screener_summary}
+SCREENER (top 20): {screener_summary}
 
-DEEP ANALYSIS — top 5 candidates selected for full review:
-Technicals: {json.dumps(compact_tech, separators=(',', ':'))}
-News: {json.dumps({s: h for s, h in data['news'].items() if h}, separators=(',', ':'))}
-Earnings risk (days until): {', '.join(f"{s}:{v.get('days_until','?')}d" for s,v in data['earnings'].items() if isinstance(v.get('days_until'), int)) or 'none known'}
+DEEP CANDIDATES — setup pre-classified, entry_suggest already +0.3%:
+{candidates_block}
 
-For each of the 5 deep candidates output a JSON decision block, then a brief reflection."""
+Rules: If SETUP is A/B/C and no REJECT/EARNINGS block → output BUY using entry_suggest as entry_limit.
+If SETUP=REJECT or NO_SETUP → output NO TRADE with the rejection reason.
+For each candidate output one JSON decision block, then 1-sentence reflection."""
 
     print("\nAsking LLM for decisions...")
     messages = [{"role": "user", "content": prompt}]
