@@ -84,6 +84,24 @@ def _save_state(state: dict):
     STATE_FILE.write_text(json.dumps(state, indent=2))
 
 
+def save_stop_level(symbol: str, stop_loss: float, take_profit: float, entry_limit: float):
+    """Persist stop/target into state.json so remote routines can monitor positions."""
+    state = _load_state()
+    state.setdefault("active_stops", {})[symbol.upper()] = {
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "entry_limit": entry_limit,
+    }
+    _save_state(state)
+
+
+def remove_stop_level(symbol: str):
+    """Remove stop level from state.json when a position is closed."""
+    state = _load_state()
+    state.get("active_stops", {}).pop(symbol.upper(), None)
+    _save_state(state)
+
+
 def check_weekly_circuit_breaker(current_equity: float) -> tuple:
     """
     Returns (tripped: bool, message: str).

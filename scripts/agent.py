@@ -670,16 +670,16 @@ def _execute_from_text(text: str, account: dict) -> dict:
             qty = math.floor(raw_qty * 100) / 100
             if entry > 0:
                 qty = min(qty, math.floor((100.0 / entry) * 100) / 100)
-            result = trade_module.place_buy(
-                ticker,
-                qty,
-                float(decision.get("entry_limit", decision.get("entry", 0))),
-                float(decision.get("stop_loss", decision.get("stop", 0))),
-                float(decision.get("take_profit", decision.get("target", 0))),
-                decision.get("thesis", "agent decision")
-            )
+            stop  = float(decision.get("stop_loss",  decision.get("stop",   0)))
+            tgt   = float(decision.get("take_profit", decision.get("target", 0)))
+            entry = float(decision.get("entry_limit", decision.get("entry",  0)))
+            result = trade_module.place_buy(ticker, qty, entry, stop, tgt,
+                                            decision.get("thesis", "agent decision"))
             print(f"\n→ ORDER: {json.dumps(result)}")
             results[ticker] = result
+            # Persist stop level to state.json so remote routines can monitor it
+            if result.get("status") == "SUBMITTED" and stop and tgt:
+                trade_module.save_stop_level(ticker, stop, tgt, entry)
         elif action == "SELL" and ticker:
             result = trade_module.place_sell(
                 ticker,
@@ -688,30 +688,44 @@ def _execute_from_text(text: str, account: dict) -> dict:
             )
             print(f"\n→ ORDER: {json.dumps(result)}")
             results[ticker] = result
+            if result.get("status") == "SUBMITTED":
+                trade_module.remove_stop_level(ticker)
     return results
 
 
 def _load_stop_levels() -> dict:
     """
-    Read the most recent BUY decision for each symbol from journal history.
-    Returns {symbol: {"stop_loss": float, "take_profit": float, "entry": float}}.
-    Used to monitor fractional positions that have no automatic stop orders.
+    Load stop/target levels for all open positions.
+    Primary source: data/state.json (committed to git — visible to remote routines).
+    Fallback: local journal files (for levels not yet written to state.json).
+    Returns {symbol: {"stop_loss": float, "take_profit": float, "entry_limit": float}}.
     """
+    stops = {}
+
+    # Primary: state.json — survives git clone, works in remote routines
+    state_file = Path(__file__).parent.parent / "data" / "state.json"
+    try:
+        state = json.loads(state_file.read_text()) if state_file.exists() else {}
+        for sym, levels in state.get("active_stops", {}).items():
+            stops[sym] = levels
+    except Exception:
+        pass
+
+    # Fallback: local journal files (supplement, don't overwrite state.json entries)
     import glob
     journal_dir = Path(__file__).parent.parent / "journal"
-    files = sorted(glob.glob(str(journal_dir / "*.json")), reverse=True)
-    stops = {}
-    for f in files[:30]:  # look back at most 30 entries
+    for f in sorted(glob.glob(str(journal_dir / "*.json")), reverse=True)[:30]:
         try:
             with open(f) as fh:
                 entry = json.load(fh)
             for d in entry.get("decisions", []):
                 sym = d.get("ticker", "")
-                if d.get("action") == "BUY" and d.get("execution_status") == "SUBMITTED" and sym not in stops:
+                if (d.get("action") == "BUY" and d.get("execution_status") == "SUBMITTED"
+                        and sym not in stops):
                     stops[sym] = {
-                        "stop_loss": d.get("stop_loss"),
+                        "stop_loss":  d.get("stop_loss"),
                         "take_profit": d.get("take_profit"),
-                        "entry": d.get("entry_limit"),
+                        "entry_limit": d.get("entry_limit"),
                     }
         except Exception:
             continue
@@ -750,6 +764,8 @@ def _check_fractional_stops(dry_run: bool = False):
                 if not dry_run:
                     result = trade_module.place_sell(sym, float(p["qty"]), reason)
                     print(f"  → {json.dumps(result)}")
+                    if result.get("status") == "SUBMITTED":
+                        trade_module.remove_stop_level(sym)
             else:
                 stop_str = f"stop ${stop}" if stop else "no stop recorded"
                 target_str = f"target ${target}" if target else "no target recorded"

@@ -1,4 +1,10 @@
 {
   "week_key": "2026-W20",
-  "week_start_equity": 1000.0
+  "week_start_equity": 1000.0,
+  "active_stops": {
+    "TGT": {"stop_loss": 116.96, "take_profit": 135.43, "entry_limit": 123.12},
+    "UBER": {"stop_loss": 71.47, "take_profit": 82.75, "entry_limit": 75.23},
+    "WMT": {"stop_loss": 125.02, "take_profit": 144.76, "entry_limit": 131.6},
+    "XLE": {"stop_loss": 54.31, "take_profit": 61.45, "entry_limit": 57.07}
+  }
 }
