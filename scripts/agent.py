@@ -28,36 +28,45 @@ sys.path.insert(0, str(Path(__file__).parent))
 
 import research
 import trade as trade_module
+import outcomes
 import journal as journal_module
 
 load_dotenv()
 
 LLM_PROVIDER = os.getenv("LLM_PROVIDER", "groq").lower()
 
-if LLM_PROVIDER == "anthropic":
-    import anthropic as _anthropic
-    _api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not _api_key:
-        print(json.dumps({"error": "ANTHROPIC_API_KEY must be set in .env"}), file=sys.stderr)
-        sys.exit(1)
-    _anthropic_client = _anthropic.Anthropic(api_key=_api_key)
-    MODEL = "claude-sonnet-4-6"
-else:
-    from openai import OpenAI as _OpenAI
-    _api_key = os.getenv("GROQ_API_KEY")
-    if not _api_key:
-        print(json.dumps({"error": "GROQ_API_KEY must be set in .env (get free key at console.groq.com)"}), file=sys.stderr)
-        sys.exit(1)
-    import httpx as _httpx
-    # Use the combined cert bundle (macOS system keychain + corporate CA)
-    _CERT_BUNDLE = str(Path(__file__).parent.parent / "corporate_certs.pem")
-    _verify = _CERT_BUNDLE if Path(_CERT_BUNDLE).exists() else True
-    _groq_client = _OpenAI(
-        api_key=_api_key,
-        base_url="https://api.groq.com/openai/v1",
-        http_client=_httpx.Client(verify=_verify)
-    )
-    MODEL = "llama-3.3-70b-versatile"
+MODEL = "claude-sonnet-4-6" if LLM_PROVIDER == "anthropic" else "llama-3.3-70b-versatile"
+_anthropic_client = None
+_groq_client = None
+
+
+def get_anthropic_client():
+    global _anthropic_client
+    if _anthropic_client is None:
+        api_key = os.getenv("ANTHROPIC_API_KEY")
+        if not api_key:
+            raise RuntimeError("ANTHROPIC_API_KEY must be set in .env")
+        import anthropic as _anthropic
+        _anthropic_client = _anthropic.Anthropic(api_key=api_key)
+    return _anthropic_client
+
+
+def get_groq_client():
+    global _groq_client
+    if _groq_client is None:
+        api_key = os.getenv("GROQ_API_KEY")
+        if not api_key:
+            raise RuntimeError("GROQ_API_KEY must be set in .env (get free key at console.groq.com)")
+        from openai import OpenAI as _OpenAI
+        import httpx as _httpx
+        cert_bundle = str(Path(__file__).parent.parent / "corporate_certs.pem")
+        verify = cert_bundle if Path(cert_bundle).exists() else True
+        _groq_client = _OpenAI(
+            api_key=api_key,
+            base_url="https://api.groq.com/openai/v1",
+            http_client=_httpx.Client(verify=verify)
+        )
+    return _groq_client
 
 CLAUDE_MD = Path(__file__).parent.parent / "CLAUDE.md"
 WATCHLIST_PATH = Path(__file__).parent.parent / "data" / "watchlist.json"
@@ -320,7 +329,7 @@ def _call_llm(system: str, messages: list) -> tuple[str, list]:
     effective_system = system if LLM_PROVIDER == "anthropic" else GROQ_SYSTEM
 
     if LLM_PROVIDER == "anthropic":
-        resp = _anthropic_client.messages.create(
+        resp = get_anthropic_client().messages.create(
             model=MODEL,
             max_tokens=8192,
             system=effective_system,
@@ -367,7 +376,7 @@ def _call_llm(system: str, messages: list) -> tuple[str, list]:
                 oai_messages.append({"role": m["role"], "content": m["content"]})
 
         # Single-shot Groq path uses no tools — plain text completion only
-        resp = _groq_client.chat.completions.create(
+        resp = get_groq_client().chat.completions.create(
             model=MODEL,
             max_tokens=8192,
             messages=oai_messages
@@ -596,7 +605,9 @@ Output one JSON per candidate, then one-sentence reflection."""
 
     # Execute orders and capture results for journal annotation
     execution_results = {}
-    if not dry_run and not premarket:
+    if dry_run:
+        execution_results = _validate_from_text(response_text)
+    elif not premarket:
         execution_results = _execute_from_text(response_text, data["account"])
 
     # Write journal with decisions annotated with execution status
@@ -608,7 +619,10 @@ Output one JSON per candidate, then one-sentence reflection."""
             ticker = d.get("ticker", "")
             if action in ("BUY", "SELL"):
                 if dry_run:
-                    d["execution_status"] = "DRY_RUN"
+                    res = execution_results.get(ticker, {})
+                    d["execution_status"] = "DRY_RUN" if res.get("would_be_valid") else "DRY_RUN_REJECTED"
+                    d["would_be_valid"] = res.get("would_be_valid", False)
+                    d["validation_msg"] = res.get("validation_msg", "No validation result")
                 elif premarket:
                     d["execution_status"] = "NOT_SUBMITTED"
                 elif ticker in execution_results:
@@ -690,6 +704,46 @@ def _execute_from_text(text: str, account: dict) -> dict:
             results[ticker] = result
             if result.get("status") == "SUBMITTED":
                 trade_module.remove_stop_level(ticker)
+    return results
+
+
+def _validate_from_text(text: str) -> dict:
+    """Validate parsed BUY/SELL decisions without submitting orders."""
+    import math
+    results = {}
+    for decision in _parse_decisions_from_text(text):
+        action = decision.get("action", "")
+        ticker = decision.get("ticker", "")
+        if action == "BUY" and ticker:
+            raw_qty = float(decision.get("qty", 0))
+            entry = float(decision.get("entry_limit", decision.get("entry", 0)) or 0)
+            qty = math.floor(raw_qty * 100) / 100
+            if entry > 0:
+                qty = min(qty, math.floor((100.0 / entry) * 100) / 100)
+            stop = float(decision.get("stop_loss", decision.get("stop", 0)))
+            tgt = float(decision.get("take_profit", decision.get("target", 0)))
+            valid, msg = trade_module.validate_order(ticker, "buy", qty, entry, stop, tgt)
+            results[ticker] = {
+                "status": "DRY_RUN",
+                "would_be_valid": valid,
+                "validation_msg": msg,
+                "symbol": ticker,
+                "side": "buy",
+                "qty": qty,
+            }
+            print(f"\n→ DRY RUN VALIDATION: {ticker} buy qty={qty} @ {entry}: {msg}")
+        elif action == "SELL" and ticker:
+            qty = round(float(decision.get("qty", 0)), 2)
+            valid, msg = trade_module.validate_order(ticker, "sell", qty, None, None, None)
+            results[ticker] = {
+                "status": "DRY_RUN",
+                "would_be_valid": valid,
+                "validation_msg": msg,
+                "symbol": ticker,
+                "side": "sell",
+                "qty": qty,
+            }
+            print(f"\n→ DRY RUN VALIDATION: {ticker} sell qty={qty}: {msg}")
     return results
 
 
@@ -898,14 +952,833 @@ def print_status():
     }, indent=2))
 
 
+def analyze_symbol(symbol: str) -> dict:
+    """
+    On-demand deep analysis for a single symbol.
+    Returns a structured dict with:
+      - technicals, news, earnings
+      - stock_trade: BUY setup or SKIP
+      - options_play: specific strategy with strikes/expiry concept
+      - verdict: one-line summary
+      - raw_analysis: full LLM text
+    """
+    symbol = symbol.strip().upper()
+
+    # Gather data
+    try:
+        tech = research.calc_technicals(symbol)
+    except Exception as e:
+        return {"error": f"Could not fetch data for {symbol}: {e}"}
+
+    # Always fetch a live quote — this is more current than the bar close
+    try:
+        quote = research.get_quote(symbol)
+    except Exception:
+        quote = {}
+
+    # Price resolution: prefer last trade > NBBO ask > bar close
+    # get_quote now returns last_trade_price when available
+    trade_price = quote.get("last_trade_price")
+    live_ask    = quote.get("ask")
+    live_bid    = quote.get("bid")
+    bar_close   = tech.get("current_price")
+    is_stale    = quote.get("is_stale", True)
+    data_age    = quote.get("data_age_minutes")
+
+    # Use the freshest price available
+    canonical_price = trade_price or (live_ask if not is_stale else None) or bar_close or 0
+    price = canonical_price
+
+    # Pick the best timestamp to display
+    quote_ts = quote.get("last_trade_timestamp") or quote.get("timestamp", "")
+
+    # Warn if canonical price diverges significantly from bar close (>2%)
+    price_divergence = None
+    if canonical_price and bar_close and bar_close > 0:
+        price_divergence = round((canonical_price - bar_close) / bar_close * 100, 2)
+
+    try:
+        news_data = research.get_news(symbol, hours=48)
+        headlines = [i["headline"] for i in news_data.get("items", [])[:5]]
+    except Exception:
+        headlines = []
+
+    try:
+        cal = research.check_earnings_calendar(symbol)
+        earnings_info = cal.get("earnings_check", [{}])[0]
+    except Exception:
+        earnings_info = {}
+
+    system = """You are a professional buy-side analyst and options strategist.
+Given market data for a stock, provide:
+1. A stock trade recommendation (BUY setup with entry/stop/target, or SKIP)
+2. A catalyst-driven options play (call or put, specific strikes, expiry tied to a REAL upcoming event)
+3. A one-line verdict
+
+CRITICAL PRICE RULE: Base ALL price levels (entry, stop, target, strike prices) on the CURRENT PRICE provided,
+not the MA or bar close. Entry for a BUY should be at or just above the current price.
+
+CRITICAL OPTIONS RULE: The options play must be tied to a SPECIFIC catalyst:
+- If there is recent news → explain how that news historically moves this stock/sector, then size the play
+- If earnings are approaching → time the expiry past the earnings date
+- If no clear catalyst → recommend Skip for options, not a generic spread
+- Strike prices must be realistic: ATM or slightly OTM relative to the current price
+- Prefer bull call spread (bullish) or bear put spread (bearish) over naked options
+- Always state: what event makes this profitable, and when it should happen
+
+Output valid JSON only — no markdown, no extra text."""
+
+    price_source = "last trade" if trade_price else ("NBBO ask" if live_ask and not is_stale else "bar close (stale)")
+    age_str = f"{data_age:.0f}m ago" if data_age is not None else "unknown age"
+
+    today_label = datetime.now().strftime("%A, %B %d, %Y")
+
+    prompt = f"""Analyze {symbol} for today ({today_label}).
+
+CURRENT PRICE (use this as your anchor for ALL price levels):
+- Price: ${canonical_price} [{price_source}, {age_str}] ← USE THIS for entry, stop, target, strikes
+- Bid/Ask: ${live_bid or '?'} / ${live_ask or '?'} | Spread: {quote.get('spread_pct', '?')}%
+- Quote time: {quote_ts[:19].replace('T',' ') if quote_ts else 'unknown'}
+- Data fresh: {'YES' if not is_stale else 'NO — market closed, using last trade price'}
+
+TECHNICALS (based on yesterday's close = ${bar_close}):
+- MA20: ${tech.get('ma20', '?')} | MA50: ${tech.get('ma50', '?')}
+- RSI14: {tech.get('rsi14', '?')} | Above MA20: {tech.get('above_ma20', '?')} | Above MA50: {tech.get('above_ma50', '?')}
+- Volume ratio vs 20d avg: {tech.get('vol_ratio', '?')}x
+- 5d change: {tech.get('5d_change_pct', '?')}% | 20d change: {tech.get('20d_change_pct', '?')}%
+
+EARNINGS: {earnings_info.get('earnings_date', 'unknown')} ({earnings_info.get('days_until', '?')} days away)
+
+RECENT NEWS:
+{chr(10).join(f'- {h}' for h in headlines) if headlines else '- No recent news'}
+
+Return ONLY this JSON (fill in all fields):
+{{
+  "symbol": "{symbol}",
+  "current_price": {price},
+  "verdict": "one sentence: bullish/bearish/neutral and why",
+  "stock_trade": {{
+    "action": "BUY or SKIP",
+    "entry": null,
+    "stop": null,
+    "target": null,
+    "stop_pct": null,
+    "reward_risk": null,
+    "confidence": "HIGH/MEDIUM/LOW",
+    "thesis": "2-3 sentences",
+    "risk": "main bear case"
+  }},
+  "options_play": {{
+    "direction": "bullish / bearish / neutral  (neutral → iron condor will be built; use skip field instead if truly no play)",
+    "catalyst": "specific news or upcoming event driving this — or NONE if no clear catalyst",
+    "historical_reaction": "how this type of news typically moves this stock (from training knowledge)",
+    "why": "2-3 sentence rationale for the options direction",
+    "ideal_outcome": "what needs to happen for this to win",
+    "risk": "what would invalidate this",
+    "skip": false
+  }},
+  "skip_reason": null
+}}
+
+IMPORTANT for options_play:
+- Do NOT output strike prices, expiry dates, structure strings, or any dollar amounts — Python will compute those.
+- Set skip=true only if there is genuinely no catalyst and no directional edge.
+- direction must be exactly "bullish", "bearish", or "neutral"."""
+
+    try:
+        if LLM_PROVIDER == "anthropic":
+            resp = get_anthropic_client().messages.create(
+                model=MODEL, max_tokens=1500,
+                system=system,
+                messages=[{"role": "user", "content": prompt}]
+            )
+            raw = resp.content[0].text
+        else:
+            resp = get_groq_client().chat.completions.create(
+                model=MODEL, max_tokens=1500,
+                messages=[
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": prompt}
+                ]
+            )
+            raw = resp.choices[0].message.content
+
+        # Strip markdown code fences if present
+        import re as _re
+        raw = _re.sub(r'^```(?:json)?\s*', '', raw.strip(), flags=_re.MULTILINE)
+        raw = _re.sub(r'\s*```$', '', raw.strip(), flags=_re.MULTILINE)
+
+        result = json.loads(raw)
+        result["raw_analysis"] = raw
+        result["technicals"] = tech
+        result["headlines"] = headlines
+        result["earnings"] = earnings_info
+
+        # ── Python computes ALL options structure numbers ──────────────
+        opt_llm  = result.get("options_play", {})
+        opt_dir  = opt_llm.get("direction", "neutral").lower()
+        opt_skip = opt_llm.get("skip", False)
+
+        if not opt_skip and canonical_price and canonical_price > 0:
+            hist_vol   = tech.get("hist_vol_30d", 35.0)
+            confidence = result.get("stock_trade", {}).get("confidence", "MEDIUM")
+            computed   = _build_options_structure(canonical_price, opt_dir,
+                                                  target_weeks=4, hist_vol_pct=hist_vol,
+                                                  confidence=confidence)
+            # Always compute BOTH plays so dashboard can show both tabs
+            _dir_type  = {"bullish": "bull_call_spread", "bearish": "bear_put_spread"}.get(opt_dir)
+            _crd_type  = {"bullish": "bull_put_spread",  "bearish": "bear_call_spread"}.get(opt_dir, "iron_condor")
+            directional_play = (_build_options_structure(canonical_price, opt_dir,
+                                                          target_weeks=4, hist_vol_pct=hist_vol,
+                                                          force_type=_dir_type)
+                                 if _dir_type else None)
+            theta_play = _build_options_structure(canonical_price, opt_dir,
+                                                   target_weeks=4, hist_vol_pct=hist_vol,
+                                                   force_type=_crd_type)
+            expiry_note = (
+                f"Expiry {computed['expiry_date']} gives {computed['expiry_weeks']} weeks "
+                f"for the catalyst to resolve."
+            )
+            result["options_play"] = {
+                **opt_llm,
+                "strategy":          computed["strategy"],
+                "strategy_type":     computed.get("strategy_type", ""),
+                "is_credit":         computed.get("is_credit", False),
+                "structure":         computed["structure"],
+                "legs_note":         computed.get("legs_note", ""),
+                "atm_strike":        computed["atm_strike"],
+                "otm_strike":        computed["otm_strike"],
+                "spread_width":      computed["spread_width"],
+                "expiry_date":       computed["expiry_date"],
+                "expiry_weeks":      computed["expiry_weeks"],
+                "expiry_rationale":  expiry_note,
+                "hist_vol_pct":      computed["hist_vol_pct"],
+                "long_leg_bs":       computed["long_leg_bs"],
+                "short_leg_bs":      computed["short_leg_bs"],
+                "spread_cost_share": computed["spread_cost_share"],
+                "net_credit":        computed.get("net_credit"),
+                "credit_per_contract": computed.get("credit_per_contract"),
+                "cost_per_contract": computed["cost_per_contract"],
+                "max_gain_contract": computed["max_gain_contract"],
+                "breakeven":         computed["breakeven"],
+                "breakeven_pct":     computed["breakeven_pct"],
+                "lower_breakeven":   computed.get("lower_breakeven"),
+                "upper_breakeven":   computed.get("upper_breakeven"),
+                "profit_zone":       computed.get("profit_zone"),
+                "return_pct":        computed["return_pct"],
+                "max_loss":          computed["max_loss"],
+                "max_gain":          computed["max_gain"],
+                "directional_play":  directional_play,
+                "theta_play":        theta_play,
+            }
+            _cat = opt_llm.get("catalyst", "")
+            if directional_play:
+                outcomes.save_recommendation(symbol, directional_play,
+                    catalyst=_cat, confidence=confidence, source="symbol_analysis")
+            if theta_play:
+                outcomes.save_recommendation(symbol, theta_play,
+                    catalyst=_cat, confidence=confidence, source="symbol_analysis")
+        else:
+            result["options_play"] = {**opt_llm, "strategy": "Skip", "skip": True}
+
+        # ── Day trade signal (Python-computed, no extra LLM call) ──────
+        stock_trade = result.get("stock_trade", {})
+        day_trade_direction = stock_trade.get("action", "SKIP")
+        if day_trade_direction == "BUY" and canonical_price and canonical_price > 0:
+            atr_pct  = tech.get("atr14_pct") or 1.5
+            setup    = _detect_day_trade_setup(tech)
+            levels   = _compute_day_trade_levels(canonical_price, atr_pct)
+            result["day_trade"] = {
+                "available":     True,
+                "setup_type":    setup,
+                "catalyst":      opt_llm.get("catalyst") or stock_trade.get("thesis", "")[:80],
+                "why":           stock_trade.get("thesis", ""),
+                "risk":          stock_trade.get("risk", ""),
+                "exit_rule":     "Exit by 3:45 PM ET — no overnight holds on day trades",
+                **levels,
+            }
+        else:
+            result["day_trade"] = {
+                "available": False,
+                "reason":    "No bullish setup detected — day trade skipped",
+            }
+
+        # ── Data freshness & price accuracy metadata ──────────────────
+        result["data_meta"] = {
+            "canonical_price":      canonical_price,
+            "price_source":         price_source,
+            "last_trade_price":     trade_price,
+            "live_ask":             live_ask,
+            "live_bid":             live_bid,
+            "bar_close":            bar_close,
+            "quote_timestamp":      quote_ts,
+            "data_age_minutes":     data_age,
+            "is_stale":             is_stale,
+            "price_divergence_pct": price_divergence,
+            "fetched_at":           datetime.now().isoformat(),
+        }
+
+        # ── Validate LLM entry against canonical price ─────────────────
+        warnings = []
+        trade = result.get("stock_trade", {})
+        llm_entry = trade.get("entry")
+        if llm_entry and canonical_price and canonical_price > 0:
+            entry_diff_pct = (llm_entry - canonical_price) / canonical_price * 100
+            if abs(entry_diff_pct) > 5:
+                warnings.append(
+                    f"Entry ${llm_entry} is {entry_diff_pct:+.1f}% from current price ${canonical_price:.2f} "
+                    f"({price_source}). Consider using ${round(canonical_price * 1.002, 2)} as entry instead."
+                )
+        if price_divergence and abs(price_divergence) > 2:
+            warnings.append(
+                f"Current price (${canonical_price:.2f}) differs {price_divergence:+.1f}% from yesterday's bar close "
+                f"(${bar_close:.2f}). Technicals (MA, RSI) reflect yesterday's close."
+            )
+        if is_stale:
+            age_label = f"{data_age:.0f} min" if data_age else "unknown"
+            warnings.append(
+                f"Market data is stale ({age_label} old) — market may be closed. "
+                f"Price shown is the last known trade (${canonical_price:.2f})."
+            )
+        elif not quote_ts:
+            warnings.append("No live quote available — all prices are based on yesterday's closing bar.")
+
+        result["price_warnings"] = warnings
+        return result
+
+    except json.JSONDecodeError:
+        return {
+            "symbol": symbol,
+            "error": "LLM returned non-JSON response",
+            "raw_analysis": raw if "raw" in dir() else "",
+            "technicals": tech,
+            "headlines": headlines,
+        }
+    except Exception as e:
+        return {"symbol": symbol, "error": str(e)}
+
+
+def _detect_day_trade_setup(tech: dict) -> str:
+    """Classify the intraday setup type from daily technicals. Pure logic, no LLM."""
+    rsi       = tech.get("rsi14") or 50
+    above_ma20 = tech.get("above_ma20", False)
+    vol_ratio  = tech.get("vol_ratio") or 1.0
+    chg5       = tech.get("5d_change_pct") or 0
+    atr_pct    = tech.get("atr14_pct") or 1.5
+
+    if rsi < 35 and not above_ma20:
+        return "Oversold Bounce"
+    if chg5 > 3 and vol_ratio > 2.0:
+        return "Gap & Go"
+    if above_ma20 and vol_ratio > 1.5 and chg5 > 1.5:
+        return "Momentum Continuation"
+    if chg5 < -1.5 and above_ma20 and rsi > 40:
+        return "Pullback-to-MA Bounce"
+    if above_ma20 and abs(chg5) < 1 and 45 < rsi < 60:
+        return "Tight Consolidation Breakout"
+    return "Technical Bounce"
+
+
+def _compute_day_trade_levels(price: float, atr_pct: float) -> dict:
+    """
+    Pure-Python day trade levels using ATR-based stop.
+    Stop = 0.75× ATR below entry, clamped to 0.5–2%.
+    Target = 3:1 R/R from stop.
+    Position size capped at $100 (10% of $1k account).
+    """
+    stop_pct   = min(max(round(atr_pct * 0.75, 2), 0.5), 2.0)
+    entry      = round(price * 1.001, 2)          # slight limit premium
+    stop       = round(entry * (1 - stop_pct / 100), 2)
+    risk       = entry - stop
+    target     = round(entry + 3 * risk, 2)
+    reward     = target - entry
+    rr         = round(reward / risk, 1) if risk > 0 else 0
+
+    max_shares    = max(1, int(100 / entry))
+    risk_dollars  = round(max_shares * risk, 2)
+    reward_dollars = round(max_shares * reward, 2)
+    reward_pct    = round(reward / entry * 100, 2)
+
+    return {
+        "entry":          entry,
+        "stop":           stop,
+        "target":         target,
+        "stop_pct":       stop_pct,
+        "reward_pct":     reward_pct,
+        "rr":             rr,
+        "shares":         max_shares,
+        "risk_dollars":   risk_dollars,
+        "reward_dollars": reward_dollars,
+        "exit_time":      "3:45 PM ET",
+    }
+
+
+def _next_monthly_expiries(n: int = 4, min_days: int = 7) -> list[dict]:
+    """
+    Return the next n standard monthly options expiry dates (3rd Friday of each month)
+    that are at least min_days away. Each entry: {date_str, weeks_out, date_obj}.
+    No LLM involvement — pure calendar arithmetic.
+    """
+    from datetime import date, timedelta
+    results = []
+    today = date.today()
+    year, month = today.year, today.month
+    while len(results) < n:
+        first_day   = date(year, month, 1)
+        first_fri   = first_day + timedelta(days=(4 - first_day.weekday()) % 7)
+        third_fri   = first_fri + timedelta(weeks=2)
+        days_out    = (third_fri - today).days
+        if days_out >= min_days:
+            results.append({
+                "date_obj":  third_fri,
+                "date_str":  third_fri.strftime("%b %d, %Y"),
+                "days_out":  days_out,
+                "weeks_out": days_out // 7,
+            })
+        month += 1
+        if month > 12:
+            month = 1
+            year  += 1
+    return results
+
+
+def _bs_price(S: float, K: float, T_days: float, sigma: float,
+              r: float = 0.05, option_type: str = "call") -> float:
+    """
+    Black-Scholes option price. Pure Python stdlib — no scipy needed.
+    S=spot, K=strike, T_days=calendar days to expiry, sigma=annualized vol (decimal),
+    r=risk-free rate (decimal, default 5%).
+    """
+    import math
+    if T_days <= 0 or sigma <= 0 or S <= 0 or K <= 0:
+        return 0.0
+    T = T_days / 365.0
+    try:
+        d1 = (math.log(S / K) + (r + 0.5 * sigma ** 2) * T) / (sigma * math.sqrt(T))
+        d2 = d1 - sigma * math.sqrt(T)
+        N  = lambda x: (1.0 + math.erf(x / math.sqrt(2.0))) / 2.0
+        if option_type == "call":
+            return S * N(d1) - K * math.exp(-r * T) * N(d2)
+        else:
+            return K * math.exp(-r * T) * N(-d2) - S * N(-d1)
+    except (ValueError, ZeroDivisionError):
+        return 0.0
+
+
+def _select_options_strategy(direction: str, confidence: str) -> str:
+    """
+    Pick strategy type from direction + confidence.
+    HIGH confidence + strong direction → debit (bet on the move, unlimited upside within spread).
+    MEDIUM / LOW                       → credit (collect theta, win if flat or slightly wrong).
+    Neutral                            → iron condor (collect premium from both sides).
+    """
+    d = direction.lower()
+    c = (confidence or "MEDIUM").upper()
+    if "neutral" in d or not d:
+        return "iron_condor"
+    if "bull" in d:
+        return "bull_call_spread" if c == "HIGH" else "bull_put_spread"
+    if "bear" in d:
+        return "bear_put_spread" if c == "HIGH" else "bear_call_spread"
+    return "skip"
+
+
+def _options_plain_english(s: dict) -> str:
+    """One plain-English sentence describing what happens if you enter this trade."""
+    st = s.get("strategy_type", "")
+    exp = s.get("expiry_date", "expiry")
+    be  = s.get("breakeven")
+    lbe = s.get("lower_breakeven")
+    ube = s.get("upper_breakeven")
+    gc  = s.get("max_gain_contract", 0)
+    cc  = s.get("cost_per_contract", 0)
+    if st == "bull_call_spread":
+        return f"You pay ~${cc:.0f}. You profit if the stock rises above ${be} by {exp}. Max win: ~${gc:.0f}."
+    if st == "bear_put_spread":
+        return f"You pay ~${cc:.0f}. You profit if the stock falls below ${be} by {exp}. Max win: ~${gc:.0f}."
+    if st == "bull_put_spread":
+        return f"You collect ~${gc:.0f} now. You keep it if the stock stays above ${be} through {exp}. You risk ~${cc:.0f} if wrong."
+    if st == "bear_call_spread":
+        return f"You collect ~${gc:.0f} now. You keep it if the stock stays below ${be} through {exp}. You risk ~${cc:.0f} if wrong."
+    if st == "iron_condor":
+        return f"You collect ~${gc:.0f} now. You keep it if the stock stays between ${lbe} and ${ube} through {exp}. You risk ~${cc:.0f} if it breaks out."
+    return ""
+
+
+def _build_options_structure(price: float, direction: str,
+                              target_weeks: int = 4,
+                              hist_vol_pct: float = 35.0,
+                              confidence: str = "MEDIUM",
+                              force_type: str = None) -> dict:
+    """
+    Build the concrete options structure — ALL arithmetic here, no LLM.
+    Strategy selection via _select_options_strategy():
+
+      bullish  HIGH   → Bull Call Spread  (debit  — pay premium, bet on move)
+      bullish  MED/LO → Bull Put Spread   (credit — collect theta, win if flat/up)
+      bearish  HIGH   → Bear Put Spread   (debit  — pay premium, bet on move)
+      bearish  MED/LO → Bear Call Spread  (credit — collect theta, win if flat/down)
+      neutral         → Iron Condor       (credit — win if stock stays in range)
+
+    Credit-spread key metrics:
+      cost_per_contract  = max loss at risk (spread_width - credit) × 100
+      max_gain_contract  = credit received × 100
+      credit_per_contract = same as max_gain_contract (explicit)
+      return_pct         = credit / max_risk × 100
+    """
+    if not price or price <= 0:
+        return {"error": "no valid price"}
+
+    if   price <  20: incr = 0.50
+    elif price <  50: incr = 1.00
+    elif price < 100: incr = 2.50
+    else:             incr = 5.00
+
+    def snap(p): return round(round(p / incr) * incr, 2)
+
+    st = force_type or _select_options_strategy(direction, confidence)
+    sigma = hist_vol_pct / 100.0
+
+    expiries = _next_monthly_expiries(n=6)
+    min_d    = max(7, (target_weeks - 1) * 7)
+    chosen   = next((e for e in expiries if e["days_out"] >= min_d), expiries[0])
+    T        = chosen["days_out"]
+    exp_str  = chosen["date_str"]
+    exp_wks  = chosen["weeks_out"]
+
+    def _base():
+        return {"expiry_date": exp_str, "expiry_weeks": exp_wks, "expiry_days": T,
+                "hist_vol_pct": round(hist_vol_pct, 1), "strategy_type": st}
+
+    # ── Bull Call Spread (debit, bullish HIGH) ────────────────────────────
+    if st == "bull_call_spread":
+        atm = snap(price);  otm = snap(price * 1.07)
+        lb  = round(_bs_price(price, atm, T, sigma, option_type="call"), 2)
+        sb  = round(_bs_price(price, otm, T, sigma, option_type="call"), 2)
+        dc  = max(lb - sb, 0.01);  sw = round(otm - atm, 2)
+        mg  = round(sw - dc, 2)
+        cc  = round(dc * 100, 2);  gc = round(mg * 100, 2)
+        be  = round(atm + dc, 2);  bp = round((be - price) / price * 100, 1)
+        rp  = round(gc / cc * 100, 1) if cc > 0 else 0
+        r = {**_base(), "strategy": "Bull Call Spread", "is_credit": False,
+             "structure": f"Buy ${atm} call · Sell ${otm} call · Exp {exp_str} ({exp_wks} wks)",
+             "legs_note": f"Long ${atm} call ~${lb:.2f}/sh · Short ${otm} call ~${sb:.2f}/sh · Net debit ~${dc:.2f}/sh",
+             "atm_strike": atm, "otm_strike": otm, "spread_width": sw,
+             "long_leg_bs": lb, "short_leg_bs": sb, "spread_cost_share": round(dc, 2),
+             "cost_per_contract": cc, "max_gain_contract": gc,
+             "breakeven": be, "breakeven_pct": bp, "return_pct": rp,
+             "max_loss": f"~${cc:.0f}", "max_gain": f"~${gc:.0f}"}
+        r["plain_english"] = _options_plain_english(r); return r
+
+    # ── Bear Put Spread (debit, bearish HIGH) ─────────────────────────────
+    if st == "bear_put_spread":
+        atm = snap(price);  otm = snap(price * 0.93)
+        lb  = round(_bs_price(price, atm, T, sigma, option_type="put"), 2)
+        sb  = round(_bs_price(price, otm, T, sigma, option_type="put"), 2)
+        dc  = max(lb - sb, 0.01);  sw = round(atm - otm, 2)
+        mg  = round(sw - dc, 2)
+        cc  = round(dc * 100, 2);  gc = round(mg * 100, 2)
+        be  = round(atm - dc, 2);  bp = round((price - be) / price * 100, 1)
+        rp  = round(gc / cc * 100, 1) if cc > 0 else 0
+        r = {**_base(), "strategy": "Bear Put Spread", "is_credit": False,
+             "structure": f"Buy ${atm} put · Sell ${otm} put · Exp {exp_str} ({exp_wks} wks)",
+             "legs_note": f"Long ${atm} put ~${lb:.2f}/sh · Short ${otm} put ~${sb:.2f}/sh · Net debit ~${dc:.2f}/sh",
+             "atm_strike": atm, "otm_strike": otm, "spread_width": sw,
+             "long_leg_bs": lb, "short_leg_bs": sb, "spread_cost_share": round(dc, 2),
+             "cost_per_contract": cc, "max_gain_contract": gc,
+             "breakeven": be, "breakeven_pct": bp, "return_pct": rp,
+             "max_loss": f"~${cc:.0f}", "max_gain": f"~${gc:.0f}"}
+        r["plain_english"] = _options_plain_english(r); return r
+
+    # ── Bull Put Spread (credit, bullish MED/LOW) ─────────────────────────
+    if st == "bull_put_spread":
+        sp = snap(price * 0.93);  lp = snap(price * 0.86)
+        sb = round(_bs_price(price, sp, T, sigma, option_type="put"), 2)
+        lb = round(_bs_price(price, lp, T, sigma, option_type="put"), 2)
+        nc = max(sb - lb, 0.01);  sw = round(sp - lp, 2)
+        ml = round(sw - nc, 2)
+        cc = round(ml * 100, 2);  gc = round(nc * 100, 2)
+        be = round(sp - nc, 2);   bp = round((price - be) / price * 100, 1)
+        rp = round(gc / cc * 100, 1) if cc > 0 else 0
+        r = {**_base(), "strategy": "Bull Put Spread", "is_credit": True,
+             "structure": f"Sell ${sp} put · Buy ${lp} put · Exp {exp_str} ({exp_wks} wks) · Credit ~${nc:.2f}/sh",
+             "legs_note": f"Short ${sp} put ~${sb:.2f}/sh · Long ${lp} put ~${lb:.2f}/sh · Net credit ~${nc:.2f}/sh",
+             "atm_strike": sp, "otm_strike": lp, "spread_width": sw,
+             "long_leg_bs": lb, "short_leg_bs": sb, "spread_cost_share": round(nc, 2),
+             "net_credit": round(nc, 2), "credit_per_contract": gc,
+             "cost_per_contract": cc, "max_gain_contract": gc,
+             "breakeven": be, "lower_breakeven": be, "breakeven_pct": bp, "return_pct": rp,
+             "max_loss": f"~${cc:.0f}", "max_gain": f"~${gc:.0f}"}
+        r["plain_english"] = _options_plain_english(r); return r
+
+    # ── Bear Call Spread (credit, bearish MED/LOW) ────────────────────────
+    if st == "bear_call_spread":
+        sc = snap(price * 1.07);  lc = snap(price * 1.14)
+        sb = round(_bs_price(price, sc, T, sigma, option_type="call"), 2)
+        lb = round(_bs_price(price, lc, T, sigma, option_type="call"), 2)
+        nc = max(sb - lb, 0.01);  sw = round(lc - sc, 2)
+        ml = round(sw - nc, 2)
+        cc = round(ml * 100, 2);  gc = round(nc * 100, 2)
+        be = round(sc + nc, 2);   bp = round((be - price) / price * 100, 1)
+        rp = round(gc / cc * 100, 1) if cc > 0 else 0
+        r = {**_base(), "strategy": "Bear Call Spread", "is_credit": True,
+             "structure": f"Sell ${sc} call · Buy ${lc} call · Exp {exp_str} ({exp_wks} wks) · Credit ~${nc:.2f}/sh",
+             "legs_note": f"Short ${sc} call ~${sb:.2f}/sh · Long ${lc} call ~${lb:.2f}/sh · Net credit ~${nc:.2f}/sh",
+             "atm_strike": sc, "otm_strike": lc, "spread_width": sw,
+             "long_leg_bs": lb, "short_leg_bs": sb, "spread_cost_share": round(nc, 2),
+             "net_credit": round(nc, 2), "credit_per_contract": gc,
+             "cost_per_contract": cc, "max_gain_contract": gc,
+             "breakeven": be, "upper_breakeven": be, "breakeven_pct": bp, "return_pct": rp,
+             "max_loss": f"~${cc:.0f}", "max_gain": f"~${gc:.0f}"}
+        r["plain_english"] = _options_plain_english(r); return r
+
+    # ── Iron Condor (credit, neutral) ────────────────────────────────────
+    if st == "iron_condor":
+        sc = snap(price * 1.07);  lc = snap(price * 1.14)
+        sp = snap(price * 0.93);  lp = snap(price * 0.86)
+        sc_bs = round(_bs_price(price, sc, T, sigma, option_type="call"), 2)
+        lc_bs = round(_bs_price(price, lc, T, sigma, option_type="call"), 2)
+        sp_bs = round(_bs_price(price, sp, T, sigma, option_type="put"), 2)
+        lp_bs = round(_bs_price(price, lp, T, sigma, option_type="put"), 2)
+        nc  = max((sc_bs - lc_bs) + (sp_bs - lp_bs), 0.01)
+        sw  = round(lc - sc, 2)           # wing width (lc > sc, always positive)
+        ml  = round(sw - nc, 2)
+        cc  = round(ml * 100, 2);  gc = round(nc * 100, 2)
+        ube = round(sc + nc, 2);   lbe = round(sp - nc, 2)
+        bpw = round((ube - lbe) / price * 100, 1)   # profit-zone width as % of price
+        rp  = round(gc / cc * 100, 1) if cc > 0 else 0
+        r = {**_base(), "strategy": "Iron Condor", "is_credit": True,
+             "structure": f"Sell ${sp}p/${sc}c · Buy ${lp}p/${lc}c · Exp {exp_str} ({exp_wks} wks) · Credit ~${nc:.2f}/sh",
+             "legs_note": f"Puts: short ${sp} ~${sp_bs:.2f} / long ${lp} ~${lp_bs:.2f} · Calls: short ${sc} ~${sc_bs:.2f} / long ${lc} ~${lc_bs:.2f}",
+             "atm_strike": sp, "otm_strike": sc, "spread_width": sw,
+             "long_leg_bs": lp_bs, "short_leg_bs": sp_bs, "spread_cost_share": round(nc, 2),
+             "net_credit": round(nc, 2), "credit_per_contract": gc,
+             "cost_per_contract": cc, "max_gain_contract": gc,
+             "breakeven": lbe, "lower_breakeven": lbe, "upper_breakeven": ube,
+             "profit_zone": f"${lbe} – ${ube}",
+             "breakeven_pct": bpw, "return_pct": rp,
+             "max_loss": f"~${cc:.0f}", "max_gain": f"~${gc:.0f}",
+             "ic_short_call": sc, "ic_long_call": lc, "ic_short_put": sp, "ic_long_put": lp}
+        r["plain_english"] = _options_plain_english(r); return r
+
+    return {"strategy": "Skip", "skip": True}
+
+
+def analyze_daily_options_play() -> dict:
+    """
+    Catalyst-first daily options play scanner.
+
+    LLM does ONLY: sector selection, ticker choice, direction, catalyst/thesis (qualitative).
+    Python does ALL math: strike prices, expiry date, max loss/gain, spread width.
+    """
+    import re as _re
+    import research
+
+    # ── Step 1: Sector snapshot ────────────────────────────────────────────
+    try:
+        sectors = research.get_sector_snapshot()
+    except Exception as e:
+        sectors = {}
+
+    sector_lines = []
+    for etf, s in sectors.items():
+        if isinstance(s, dict) and "name" in s:
+            arrow = "↑" if s.get("above_ma20") else "↓"
+            sector_lines.append(
+                f"  {etf} ({s['name']}): 5d={s.get('5d_change_pct',0):+.1f}%  "
+                f"20d={s.get('20d_change_pct',0):+.1f}%  RSI={s.get('rsi14','?')}  "
+                f"{arrow}MA20"
+            )
+
+    # ── Step 2: Market-wide news ───────────────────────────────────────────
+    try:
+        news_data = research.get_news(None, hours=48)
+        headlines = [
+            f"  [{i['source']}] {i['headline']}"
+            for i in news_data.get("items", [])[:15]
+        ]
+    except Exception:
+        news_data = {}
+        headlines = ["  (news unavailable)"]
+
+    # ── Step 3: LLM — qualitative judgment only, zero math ────────────────
+    today_str = datetime.now().strftime("%A, %B %d, %Y")
+
+    system_pick = """You are a professional options strategist doing a daily market scan.
+Given sector ETF performance and today's market news, identify the ONE best
+catalyst-driven options opportunity for the next 2-4 weeks.
+
+Your job is ONLY to identify:
+- Which sector has the clearest catalyst today
+- Which specific liquid stock in that sector to play
+- Bullish or bearish direction
+- Why (catalyst + historical pattern)
+
+Do NOT include any numbers, prices, strikes, dates, or calculations — those are handled separately.
+
+Output ONLY valid JSON with these exact fields:
+{
+  "sector_etf": "XLK",
+  "sector_name": "Technology",
+  "sector_trend": "bullish",
+  "catalyst_headline": "exact headline or news item driving this",
+  "catalyst_type": "earnings/macro/product/regulatory/sentiment",
+  "historical_reaction": "how this type of news typically moves this sector/stock (1-2 sentences from training knowledge)",
+  "direction": "bullish",
+  "ticker": "NVDA",
+  "why_ticker": "why this stock specifically over other sector leaders",
+  "why": "2-3 sentence thesis connecting catalyst to directional play",
+  "ideal_outcome": "what needs to happen over the next few weeks for this to work",
+  "risk": "what would invalidate this thesis",
+  "confidence": "HIGH/MEDIUM/LOW"
+}"""
+
+    prompt_pick = f"""Daily options scan — {today_str}.
+
+SECTOR ETF PERFORMANCE (5d / 20d change, RSI, vs MA20):
+{chr(10).join(sector_lines) if sector_lines else '  (unavailable)'}
+
+TODAY'S MARKET NEWS (last 48 hours):
+{chr(10).join(headlines)}
+
+Identify the sector with the strongest catalyst and the best stock to play. Output JSON only."""
+
+    try:
+        if LLM_PROVIDER == "anthropic":
+            r = get_anthropic_client().messages.create(
+                model=MODEL, max_tokens=800,
+                system=system_pick,
+                messages=[{"role": "user", "content": prompt_pick}]
+            )
+            raw = r.content[0].text
+        else:
+            r = get_groq_client().chat.completions.create(
+                model=MODEL, max_tokens=800,
+                messages=[{"role": "system", "content": system_pick},
+                          {"role": "user",   "content": prompt_pick}]
+            )
+            raw = r.choices[0].message.content or ""
+
+        raw = raw.strip()
+        raw = _re.sub(r'^```(?:json)?\s*', '', raw)
+        raw = _re.sub(r'\s*```$', '', raw.strip())
+        pick = json.loads(raw.strip())
+    except Exception as e:
+        return {"error": f"LLM failed: {e}", "raw": raw if "raw" in dir() else ""}
+
+    # ── Step 4: Fetch live price — Python only ─────────────────────────────
+    ticker = pick.get("ticker", "")
+    ticker_data = {}
+    last_price = None
+    if ticker:
+        try:
+            ticker_data = research.calc_technicals(ticker)
+            quote       = research.get_quote(ticker)
+            last_price  = (quote.get("last_trade_price")
+                           or quote.get("ask")
+                           or ticker_data.get("current_price"))
+            ticker_data["last_trade"] = last_price
+            ticker_data["is_stale"]   = quote.get("is_stale", True)
+        except Exception:
+            pass
+
+    # ── Step 5: Python builds the entire options structure ─────────────────
+    direction  = pick.get("direction", "bullish").lower()
+    confidence = pick.get("confidence", "MEDIUM")
+    hist_vol   = ticker_data.get("hist_vol_30d", 35.0)
+    opt_struct = {}
+    if last_price:
+        opt_struct   = _build_options_structure(last_price, direction,
+                                                target_weeks=4, hist_vol_pct=hist_vol,
+                                                confidence=confidence)
+        _dir_type    = {"bullish": "bull_call_spread", "bearish": "bear_put_spread"}.get(direction)
+        _crd_type    = {"bullish": "bull_put_spread",  "bearish": "bear_call_spread"}.get(direction, "iron_condor")
+        dir_play     = (_build_options_structure(last_price, direction,
+                                                  target_weeks=4, hist_vol_pct=hist_vol,
+                                                  force_type=_dir_type) if _dir_type else None)
+        theta_play   = _build_options_structure(last_price, direction,
+                                                 target_weeks=4, hist_vol_pct=hist_vol,
+                                                 force_type=_crd_type)
+    else:
+        opt_struct = {"error": "no live price — cannot compute strikes"}
+        dir_play = theta_play = None
+
+    # Build expiry rationale from computed data (no LLM needed)
+    expiry_rationale = ""
+    if opt_struct.get("expiry_weeks"):
+        expiry_rationale = (
+            f"Expiry {opt_struct['expiry_date']} gives {opt_struct['expiry_weeks']} weeks "
+            f"for the catalyst to play out — standard 4-week window for news-driven moves."
+        )
+
+    # ── Assemble final result ──────────────────────────────────────────────
+    play = {
+        **pick,
+        "strategy":            opt_struct.get("strategy", "—"),
+        "strategy_type":       opt_struct.get("strategy_type", ""),
+        "is_credit":           opt_struct.get("is_credit", False),
+        "structure":           opt_struct.get("structure", "—"),
+        "legs_note":           opt_struct.get("legs_note", ""),
+        "atm_strike":          opt_struct.get("atm_strike"),
+        "otm_strike":          opt_struct.get("otm_strike"),
+        "spread_width":        opt_struct.get("spread_width"),
+        "expiry_date":         opt_struct.get("expiry_date"),
+        "expiry_weeks":        opt_struct.get("expiry_weeks"),
+        "expiry_days":         opt_struct.get("expiry_days"),
+        "expiry_rationale":    expiry_rationale,
+        "hist_vol_pct":        opt_struct.get("hist_vol_pct"),
+        "long_leg_bs":         opt_struct.get("long_leg_bs"),
+        "short_leg_bs":        opt_struct.get("short_leg_bs"),
+        "spread_cost_share":   opt_struct.get("spread_cost_share"),
+        "net_credit":          opt_struct.get("net_credit"),
+        "credit_per_contract": opt_struct.get("credit_per_contract"),
+        "cost_per_contract":   opt_struct.get("cost_per_contract"),
+        "max_gain_contract":   opt_struct.get("max_gain_contract"),
+        "breakeven":           opt_struct.get("breakeven"),
+        "breakeven_pct":       opt_struct.get("breakeven_pct"),
+        "lower_breakeven":     opt_struct.get("lower_breakeven"),
+        "upper_breakeven":     opt_struct.get("upper_breakeven"),
+        "profit_zone":         opt_struct.get("profit_zone"),
+        "return_pct":          opt_struct.get("return_pct"),
+        "max_loss":            opt_struct.get("max_loss", "—"),
+        "max_gain":            opt_struct.get("max_gain", "—"),
+        "directional_play":    dir_play,
+        "theta_play":          theta_play,
+        "ticker_price":        last_price,
+        "ticker_technicals":   ticker_data,
+        "sector_snapshot":     sectors,
+        "news_headlines":      [i["headline"] for i in news_data.get("items", [])[:8]],
+        "generated_at":        datetime.now().isoformat(),
+    }
+    _dp_ticker = pick.get("ticker", "")
+    _dp_cat    = pick.get("catalyst_headline", pick.get("catalyst", ""))
+    _dp_conf   = pick.get("confidence", "MEDIUM")
+    if _dp_ticker:
+        if dir_play:
+            outcomes.save_recommendation(_dp_ticker, dir_play,
+                catalyst=_dp_cat, confidence=_dp_conf, source="daily_options")
+        if theta_play:
+            outcomes.save_recommendation(_dp_ticker, theta_play,
+                catalyst=_dp_cat, confidence=_dp_conf, source="daily_options")
+    return play
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Trading agent cycle runner")
     parser.add_argument("--dry-run", action="store_true", help="Research and decide, but skip order submission")
     parser.add_argument("--premarket", action="store_true", help="Pre-market scan only")
     parser.add_argument("--status", action="store_true", help="Quick portfolio snapshot (no LLM call)")
+    parser.add_argument("--analyze", metavar="SYMBOL", help="On-demand analysis for a single symbol")
+    parser.add_argument("--daily-options", action="store_true", help="Run catalyst-first daily options play scan")
     args = parser.parse_args()
 
     if args.status:
         print_status()
+    elif args.analyze:
+        result = analyze_symbol(args.analyze)
+        print(json.dumps(result, indent=2))
+    elif args.daily_options:
+        result = analyze_daily_options_play()
+        print(json.dumps(result, indent=2))
     else:
         run_cycle(dry_run=args.dry_run, premarket=args.premarket)

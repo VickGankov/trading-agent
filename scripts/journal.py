@@ -53,25 +53,30 @@ def get_summary(days: int = 7):
     total_cycles = len(entries)
     trades_placed = 0
     rejections = 0
+    dry_run_orders = 0
     no_trade_cycles = 0
     decisions_summary = {"BUY": 0, "SELL": 0, "HOLD": 0, "NO TRADE": 0}
     
     for e in entries:
         for d in e.get("decisions", []):
             action = d.get("action", "NO TRADE")
+            status = d.get("execution_status", "")
             if action in decisions_summary:
                 decisions_summary[action] += 1
-            if action == "BUY" or action == "SELL":
+            if action in ("BUY", "SELL") and status == "SUBMITTED":
                 trades_placed += 1
-        if e.get("rejections"):
-            rejections += len(e["rejections"])
-        if not any(d.get("action") in ("BUY", "SELL") for d in e.get("decisions", [])):
+            if status in ("REJECTED", "ERROR", "DRY_RUN_REJECTED"):
+                rejections += 1
+            if status.startswith("DRY_RUN"):
+                dry_run_orders += 1
+        if not any(d.get("execution_status") == "SUBMITTED" for d in e.get("decisions", [])):
             no_trade_cycles += 1
     
     return {
         "period_days": days,
         "total_cycles": total_cycles,
         "trades_placed": trades_placed,
+        "dry_run_orders": dry_run_orders,
         "no_trade_cycles": no_trade_cycles,
         "decisions": decisions_summary,
         "validation_rejections": rejections,

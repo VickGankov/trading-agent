@@ -8,3 +8,6 @@ corporate_certs.pem
 *.egg-info/
 dist/
 build/
+journal/
+data/state.json
+data/outcomes.json

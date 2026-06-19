@@ -27,7 +27,7 @@ try:
     from alpaca.trading.client import TradingClient
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.historical.news import NewsClient
-    from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, NewsRequest
+    from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, StockLatestTradeRequest, NewsRequest
     from alpaca.data.timeframe import TimeFrame
     from alpaca.trading.requests import GetCalendarRequest
     from alpaca.trading.enums import OrderStatus
@@ -52,17 +52,43 @@ API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER = os.getenv("PAPER", "True").lower() == "true"
 
-if not API_KEY or not SECRET_KEY:
-    print(json.dumps({"error": "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env"}), file=sys.stderr)
-    sys.exit(1)
+_trading_client = None
+_data_client = None
+_news_client = None
 
-trading = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
-data = StockHistoricalDataClient(API_KEY, SECRET_KEY)
-news = NewsClient(API_KEY, SECRET_KEY)
+
+def _require_alpaca_credentials():
+    if not API_KEY or not SECRET_KEY:
+        raise RuntimeError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set in .env")
+
+
+def get_trading_client():
+    global _trading_client
+    _require_alpaca_credentials()
+    if _trading_client is None:
+        _trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
+    return _trading_client
+
+
+def get_data_client():
+    global _data_client
+    _require_alpaca_credentials()
+    if _data_client is None:
+        _data_client = StockHistoricalDataClient(API_KEY, SECRET_KEY)
+    return _data_client
+
+
+def get_news_client():
+    global _news_client
+    _require_alpaca_credentials()
+    if _news_client is None:
+        _news_client = NewsClient(API_KEY, SECRET_KEY)
+    return _news_client
 
 
 def get_account():
     """Account snapshot: cash, equity, buying power, positions."""
+    trading = get_trading_client()
     acct = trading.get_account()
     positions = trading.get_all_positions()
     
@@ -95,6 +121,7 @@ def get_account():
 
 def is_market_open():
     """Check if market is currently open and get next open/close times."""
+    trading = get_trading_client()
     clock = trading.get_clock()
     return {
         "is_open": clock.is_open,
@@ -106,6 +133,7 @@ def is_market_open():
 
 def get_bars(symbol: str, days: int = 60):
     """Get daily bars for technical analysis."""
+    data = get_data_client()
     end = datetime.now() - timedelta(minutes=20)  # IEX free feed has 15min delay
     start = end - timedelta(days=days * 2)  # extra buffer for weekends
     
@@ -137,27 +165,67 @@ def get_bars(symbol: str, days: int = 60):
 
 
 def get_quote(symbol: str):
-    """Latest quote (bid/ask)."""
-    req = StockLatestQuoteRequest(symbol_or_symbols=symbol)
-    quote = data.get_stock_latest_quote(req)
-    
-    if symbol not in quote:
-        return {"symbol": symbol, "error": "no quote"}
-    
-    q = quote[symbol]
-    return {
-        "symbol": symbol,
-        "bid": float(q.bid_price),
-        "ask": float(q.ask_price),
-        "bid_size": int(q.bid_size),
-        "ask_size": int(q.ask_size),
-        "spread_pct": ((float(q.ask_price) - float(q.bid_price)) / float(q.ask_price) * 100) if q.ask_price else None,
-        "timestamp": q.timestamp.isoformat()
-    }
+    """Latest quote (bid/ask) + latest trade price. Detects stale quotes."""
+    from datetime import timezone as _tz
+
+    data = get_data_client()
+    result: dict = {"symbol": symbol}
+
+    # --- latest NBBO quote ---
+    try:
+        q = data.get_stock_latest_quote(StockLatestQuoteRequest(symbol_or_symbols=symbol)).get(symbol)
+    except Exception:
+        q = None
+
+    quote_ts = None
+    if q:
+        ask = float(q.ask_price) if q.ask_price else None
+        bid = float(q.bid_price) if q.bid_price else None
+        quote_ts = q.timestamp
+        result.update({
+            "bid": bid,
+            "ask": ask,
+            "bid_size": int(q.bid_size) if q.bid_size else None,
+            "ask_size": int(q.ask_size) if q.ask_size else None,
+            "spread_pct": ((ask - bid) / ask * 100) if ask and bid else None,
+            "timestamp": quote_ts.isoformat(),
+        })
+
+    # --- latest trade (more reliable intraday price) ---
+    trade_price = None
+    trade_ts = None
+    try:
+        t = data.get_stock_latest_trade(StockLatestTradeRequest(symbol_or_symbols=symbol)).get(symbol)
+        if t:
+            trade_price = float(t.price)
+            trade_ts = t.timestamp
+            result["last_trade_price"] = trade_price
+            result["last_trade_timestamp"] = trade_ts.isoformat()
+    except Exception:
+        pass
+
+    # --- staleness check ---
+    # Mark the quote stale if it's older than 20 minutes relative to now
+    now_utc = datetime.now(_tz.utc)
+    ref_ts = trade_ts or quote_ts
+    if ref_ts:
+        ts_utc = ref_ts.astimezone(_tz.utc) if ref_ts.tzinfo else ref_ts.replace(tzinfo=_tz.utc)
+        age_minutes = (now_utc - ts_utc).total_seconds() / 60
+        result["data_age_minutes"] = round(age_minutes, 1)
+        result["is_stale"] = age_minutes > 20
+    else:
+        result["is_stale"] = True
+
+    # Use last trade price as the canonical "ask" if the NBBO ask is absent or stale
+    if trade_price and (not result.get("ask") or result.get("is_stale")):
+        result["ask"] = trade_price
+
+    return result
 
 
 def get_news(symbol: Optional[str] = None, hours: int = 24):
     """Recent news for a symbol or general market news."""
+    news = get_news_client()
     start = datetime.now() - timedelta(hours=hours)
     req = NewsRequest(
         symbols=symbol if symbol else None,
@@ -208,6 +276,25 @@ def calc_technicals(symbol: str):
     df["vol_ratio"] = df["volume"] / df["vol_avg20"]
     
     last = df.iloc[-1]
+
+    # 30-day annualized historical volatility (log-return std × √252)
+    log_ret = np.log(df["close"] / df["close"].shift(1)).dropna()
+    hist_vol_30d = float(log_ret.iloc[-30:].std() * np.sqrt(252)) if len(log_ret) >= 10 else 0.30
+
+    # ATR14 — for day trade stop sizing
+    df["high"] = df["high"].astype(float)
+    df["low"]  = df["low"].astype(float)
+    df["prev_close"] = df["close"].shift(1)
+    df["tr"] = np.maximum(
+        df["high"] - df["low"],
+        np.maximum(
+            (df["high"] - df["prev_close"]).abs(),
+            (df["low"]  - df["prev_close"]).abs()
+        )
+    )
+    atr14 = float(df["tr"].rolling(14).mean().iloc[-1]) if len(df) >= 14 else float(last["close"] * 0.015)
+    atr14_pct = round(atr14 / float(last["close"]) * 100, 2)
+
     result = {
         "symbol": symbol,
         "current_price": round(float(last["close"]), 2),
@@ -219,8 +306,11 @@ def calc_technicals(symbol: str):
         "vol_ratio": round(float(last["vol_ratio"]), 2) if not pd.isna(last["vol_ratio"]) else None,
         "above_ma20": bool(last["close"] > last["ma20"]) if not pd.isna(last["ma20"]) else None,
         "above_ma50": bool(last["close"] > last["ma50"]) if not pd.isna(last["ma50"]) else None,
-        "5d_change_pct": round(float((last["close"] / df["close"].iloc[-6] - 1) * 100), 2) if len(df) >= 6 else None,
-        "20d_change_pct": round(float((last["close"] / df["close"].iloc[-21] - 1) * 100), 2) if len(df) >= 21 else None
+        "5d_change_pct":  round(float((last["close"] / df["close"].iloc[-6]  - 1) * 100), 2) if len(df) >= 6  else None,
+        "20d_change_pct": round(float((last["close"] / df["close"].iloc[-21] - 1) * 100), 2) if len(df) >= 21 else None,
+        "hist_vol_30d": round(hist_vol_30d * 100, 1),   # annualized %, e.g. 37.2
+        "atr14":        round(atr14, 2),                 # raw $ ATR
+        "atr14_pct":    atr14_pct,                       # ATR as % of price
     }
     _tech_cache[symbol] = result
     return result
@@ -244,6 +334,58 @@ def get_market_snapshot():
         "indices": snapshot,
         "market_status": is_market_open()
     }
+
+
+SECTOR_ETFS = {
+    "XLK":  "Technology",
+    "XLE":  "Energy",
+    "XLF":  "Financials",
+    "XLV":  "Health Care",
+    "XBI":  "Biotech",
+    "XLI":  "Industrials",
+    "XLC":  "Communications",
+    "XLY":  "Consumer Discretionary",
+    "GLD":  "Gold",
+    "USO":  "Oil",
+}
+
+# Representative high-liquidity stocks per sector for options plays
+SECTOR_LEADERS = {
+    "XLK":  ["NVDA", "MSFT", "AAPL", "AMD", "AVGO"],
+    "XLE":  ["XOM",  "CVX",  "SLB",  "EOG",  "MPC"],
+    "XLF":  ["JPM",  "GS",   "BAC",  "MS",   "V"],
+    "XLV":  ["UNH",  "LLY",  "JNJ",  "ABBV", "MRK"],
+    "XBI":  ["BIIB", "MRNA", "GILD", "REGN", "SGEN"],
+    "XLI":  ["CAT",  "DE",   "HON",  "GE",   "RTX"],
+    "XLC":  ["META", "GOOGL","NFLX", "DIS",  "SNAP"],
+    "XLY":  ["AMZN", "TSLA", "NKE",  "MCD",  "HD"],
+    "GLD":  ["GLD",  "GOLD", "NEM"],
+    "USO":  ["XOM",  "CVX",  "USO"],
+}
+
+
+def get_sector_snapshot():
+    """Performance snapshot for major sector ETFs."""
+    snapshot = {}
+    for etf, name in SECTOR_ETFS.items():
+        try:
+            tech = calc_technicals(etf)
+            if "error" not in tech:
+                snapshot[etf] = {
+                    "name":           name,
+                    "price":          tech["current_price"],
+                    "1d_change_pct":  tech.get("5d_change_pct"),   # proxy — daily not available on free tier
+                    "5d_change_pct":  tech["5d_change_pct"],
+                    "20d_change_pct": tech["20d_change_pct"],
+                    "rsi14":          tech["rsi14"],
+                    "above_ma20":     tech["above_ma20"],
+                    "above_ma50":     tech["above_ma50"],
+                    "vol_ratio":      tech["vol_ratio"],
+                    "leaders":        SECTOR_LEADERS.get(etf, [])[:3],
+                }
+        except Exception:
+            pass
+    return snapshot
 
 
 def _setup_score(tech: dict) -> float:
@@ -392,6 +534,7 @@ def check_earnings_calendar(symbols: str):
 
 def daytrade_count():
     """PDT compliance check."""
+    trading = get_trading_client()
     acct = trading.get_account()
     return {
         "daytrade_count_5days": int(acct.daytrade_count),

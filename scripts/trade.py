@@ -40,6 +40,7 @@ load_dotenv()
 API_KEY = os.getenv("ALPACA_API_KEY")
 SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER = os.getenv("PAPER", "True").lower() == "true"
+POSITION_EPSILON_PCT = 0.05
 
 # ===================================================================
 # HARD RULES - These are the guardrails. Do not loosen without review.
@@ -65,11 +66,20 @@ LEVERAGED_ETFS = {
     "UVXY", "SVXY", "VXX", "TVIX"
 }
 
-if not API_KEY or not SECRET_KEY:
-    print(json.dumps({"error": "ALPACA_API_KEY and ALPACA_SECRET_KEY must be set"}), file=sys.stderr)
-    sys.exit(1)
+_trading_client = None
 
-trading = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
+
+def _require_alpaca_credentials():
+    if not API_KEY or not SECRET_KEY:
+        raise RuntimeError("ALPACA_API_KEY and ALPACA_SECRET_KEY must be set")
+
+
+def get_trading_client():
+    global _trading_client
+    _require_alpaca_credentials()
+    if _trading_client is None:
+        _trading_client = TradingClient(API_KEY, SECRET_KEY, paper=PAPER)
+    return _trading_client
 
 
 def _load_state() -> dict:
@@ -112,8 +122,9 @@ def check_weekly_circuit_breaker(current_equity: float) -> tuple:
     iso_week = today.strftime("%G-W%V")  # e.g. "2026-W20"
 
     if state.get("week_key") != iso_week:
-        # New week — record starting equity
-        state = {"week_key": iso_week, "week_start_equity": current_equity}
+        # New week — record starting equity without wiping active stop levels.
+        state["week_key"] = iso_week
+        state["week_start_equity"] = current_equity
         _save_state(state)
         return False, "OK"
 
@@ -132,6 +143,7 @@ def check_weekly_circuit_breaker(current_equity: float) -> tuple:
 
 def get_account_state():
     """Snapshot for validation."""
+    trading = get_trading_client()
     acct = trading.get_account()
     positions = trading.get_all_positions()
     return {
@@ -148,13 +160,17 @@ def get_account_state():
 
 
 def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[float],
-                   stop_price: Optional[float], target_price: Optional[float]) -> tuple:
+                   stop_price: Optional[float], target_price: Optional[float],
+                   is_day_trade: bool = False) -> tuple:
     """
     Pre-flight validation. Returns (is_valid: bool, message: str).
     EVERY ORDER must pass this before submission.
     """
     symbol = symbol.upper()
     side = side.lower()
+
+    if qty <= 0:
+        return False, f"Quantity must be positive, got {qty}"
     
     # 1. Account state checks
     state = get_account_state()
@@ -184,17 +200,23 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
             return False, "BUY orders must specify a limit price (no market orders)"
         if stop_price is None or target_price is None:
             return False, "BUY orders must include both stop_loss and take_profit"
+        if stop_price >= limit_price:
+            return False, "Stop price must be below limit price"
+        if target_price <= limit_price:
+            return False, "Target price must be above limit price"
         
         # Price range
         if limit_price < MIN_PRICE or limit_price > MAX_PRICE:
             return False, f"Price {limit_price} outside allowed range ${MIN_PRICE}-${MAX_PRICE}"
         
-        # Stop placement
+        # Stop placement — day trades use tighter stops (0.5-2%) vs swing (3-10%)
         stop_pct = ((limit_price - stop_price) / limit_price) * 100
-        if stop_pct < MIN_STOP_PCT:
-            return False, f"Stop too tight: {stop_pct:.2f}% (min {MIN_STOP_PCT}%)"
-        if stop_pct > MAX_STOP_PCT:
-            return False, f"Stop too wide: {stop_pct:.2f}% (max {MAX_STOP_PCT}%)"
+        min_stop = 0.5 if is_day_trade else MIN_STOP_PCT
+        max_stop = 2.0 if is_day_trade else MAX_STOP_PCT
+        if stop_pct < min_stop:
+            return False, f"Stop too tight: {stop_pct:.2f}% (min {min_stop}%)"
+        if stop_pct > max_stop:
+            return False, f"Stop too wide: {stop_pct:.2f}% (max {max_stop}%)"
         
         # Risk/reward
         risk = limit_price - stop_price
@@ -207,7 +229,7 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
         position_pct = (order_value / state["equity"]) * 100
         if order_value < MIN_POSITION_USD:
             return False, f"Position too small: ${order_value:.2f} (min ${MIN_POSITION_USD})"
-        if position_pct > MAX_POSITION_PCT:
+        if position_pct > MAX_POSITION_PCT + POSITION_EPSILON_PCT:
             return False, f"Position too large: {position_pct:.2f}% (max {MAX_POSITION_PCT}%)"
         
         # Concurrent positions
@@ -235,18 +257,21 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
     return True, "OK"
 
 
-def place_buy(symbol: str, qty: float, limit_price: float, stop_price: float, target_price: float, reason: str):
+def place_buy(symbol: str, qty: float, limit_price: float, stop_price: float,
+              target_price: float, reason: str, is_day_trade: bool = False):
     """
     Place a BUY order. Whole shares get a bracket order (entry + stop + target atomic).
     Fractional shares get a simple limit order — Alpaca doesn't support bracket on fractions.
     """
-    valid, msg = validate_order(symbol, "buy", qty, limit_price, stop_price, target_price)
+    valid, msg = validate_order(symbol, "buy", qty, limit_price, stop_price, target_price,
+                                is_day_trade=is_day_trade)
     if not valid:
         return {"status": "REJECTED", "reason": msg, "symbol": symbol, "side": "buy", "qty": qty}
 
     is_fractional = (qty % 1) != 0
 
     try:
+        trading = get_trading_client()
         if is_fractional:
             order = trading.submit_order(LimitOrderRequest(
                 symbol=symbol,
@@ -291,6 +316,7 @@ def place_sell(symbol: str, qty: float, reason: str):
         return {"status": "REJECTED", "reason": msg, "symbol": symbol, "side": "sell", "qty": qty}
     
     try:
+        trading = get_trading_client()
         order = trading.submit_order(MarketOrderRequest(
             symbol=symbol,
             qty=qty,
@@ -312,6 +338,7 @@ def place_sell(symbol: str, qty: float, reason: str):
 
 def list_orders(status: str = "open"):
     """List open or recent orders."""
+    trading = get_trading_client()
     s = QueryOrderStatus.OPEN if status == "open" else QueryOrderStatus.ALL
     req = GetOrdersRequest(status=s, limit=20)
     orders = trading.get_orders(filter=req)
@@ -331,6 +358,7 @@ def list_orders(status: str = "open"):
 def cancel_order(order_id: str):
     """Cancel an open order."""
     try:
+        trading = get_trading_client()
         trading.cancel_order_by_id(order_id)
         return {"status": "CANCELED", "order_id": order_id}
     except Exception as e:
@@ -340,6 +368,7 @@ def cancel_order(order_id: str):
 def close_all_positions(reason: str = "manual"):
     """EMERGENCY: Liquidate everything."""
     try:
+        trading = get_trading_client()
         trading.close_all_positions(cancel_orders=True)
         return {"status": "ALL_CLOSED", "reason": reason, "timestamp": datetime.now().isoformat()}
     except Exception as e:
@@ -353,7 +382,7 @@ if __name__ == "__main__":
     
     pb = sub.add_parser("buy")
     pb.add_argument("symbol")
-    pb.add_argument("qty", type=int)
+    pb.add_argument("qty", type=float)
     pb.add_argument("limit_price", type=float)
     pb.add_argument("--stop", type=float, required=True)
     pb.add_argument("--target", type=float, required=True)
@@ -361,7 +390,7 @@ if __name__ == "__main__":
     
     ps = sub.add_parser("sell")
     ps.add_argument("symbol")
-    ps.add_argument("qty", type=int)
+    ps.add_argument("qty", type=float)
     ps.add_argument("--reason", default="agent decision")
     
     sub.add_parser("list_orders").add_argument("--status", default="open")

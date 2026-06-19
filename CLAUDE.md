@@ -40,8 +40,12 @@ These are enforced in code in `scripts/trade.py` via `validate_order()`. The val
 12. **Market cap filter:** Minimum $1B market cap (avoid micro-caps with manipulation risk)
 13. **No earnings gambles:** Do NOT open new positions in stocks reporting earnings in the next 3 trading days
 
-### Pattern Day Trader Compliance
-14. **You are subject to PDT rules.** Maximum 3 day trades (open and close same day) in any 5-business-day window. Track this in the journal. If you've used 3 day trades in the past 5 days, no new same-day positions.
+### Day Trading Rules (PDT rule eliminated June 4, 2026 — FINRA Regulatory Notice 26-10)
+14. **Day trades are now unrestricted by count.** The $25k PDT minimum was eliminated. No day-trade counting required.
+15. **Day trade stops are tighter: 0.5–2% below entry** (vs 3–10% for swing trades). Enforced in `validate_order(is_day_trade=True)`.
+16. **Day trade target: minimum 3:1 R/R** (stop 1% → target 3% above entry). Size stops with ATR14.
+17. **Hard exit rule: all day trades must be closed by 3:45 PM ET.** No overnight holds on positions opened as day trades.
+18. **Day trading is secondary to swing trades.** Only enter a day trade when the same symbol already has a HIGH-confidence BUY signal and a clear intraday catalyst. Do not day trade for the sake of activity.
 
 ## YOUR DECISION FRAMEWORK
 
