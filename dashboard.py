@@ -695,7 +695,8 @@ if _pm_data:
         font=dict(color="#e2e8f0", size=12),
         showlegend=False,
     )
-    st.plotly_chart(_fig_pm, use_container_width=True)
+    st.plotly_chart(_fig_pm, use_container_width=True,
+                    config={"staticPlot": True})
 
     # Catalyst headlines
     _headlined = [m for m in _pm_data if m.get("headline")]
