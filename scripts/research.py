@@ -28,7 +28,7 @@ try:
     from alpaca.data.historical import StockHistoricalDataClient
     from alpaca.data.historical.news import NewsClient
     from alpaca.data.requests import StockBarsRequest, StockLatestQuoteRequest, StockLatestTradeRequest, NewsRequest
-    from alpaca.data.timeframe import TimeFrame
+    from alpaca.data.timeframe import TimeFrame, TimeFrameUnit
     from alpaca.trading.requests import GetCalendarRequest
     from alpaca.trading.enums import OrderStatus
 except ImportError:
@@ -162,6 +162,109 @@ def get_bars(symbol: str, days: int = 60):
     ]
     
     return {"symbol": symbol, "bars": bar_list[-days:]}
+
+
+def get_intraday_bars(symbol: str, minutes: int = 5, lookback_hours: int = 8) -> dict:
+    """
+    Real-time intraday bars via Alpaca IEX feed (no delay during market hours).
+    Falls back to yfinance if Alpaca returns nothing (pre-market / no IEX trades).
+    """
+    data = get_data_client()
+    start = datetime.now() - timedelta(hours=lookback_hours)
+
+    try:
+        req = StockBarsRequest(
+            symbol_or_symbols=symbol,
+            timeframe=TimeFrame(minutes, TimeFrameUnit.Minute),
+            start=start,
+        )
+        bars = data.get_stock_bars(req)
+        if symbol in bars.data and bars.data[symbol]:
+            return {
+                "symbol": symbol,
+                "source": "alpaca_iex",
+                "bars": [
+                    {
+                        "timestamp": b.timestamp.isoformat(),
+                        "open":   float(b.open),
+                        "high":   float(b.high),
+                        "low":    float(b.low),
+                        "close":  float(b.close),
+                        "volume": int(b.volume),
+                    }
+                    for b in bars.data[symbol]
+                ],
+            }
+    except Exception:
+        pass
+
+    # Fallback: yfinance (covers pre-market and after-hours)
+    try:
+        import yfinance as yf
+        hist = yf.Ticker(symbol).history(period="1d", interval=f"{minutes}m", prepost=False)
+        if not hist.empty:
+            return {
+                "symbol": symbol,
+                "source": "yfinance_delayed",
+                "bars": [
+                    {
+                        "timestamp": str(ts),
+                        "open":   round(float(row["Open"]), 4),
+                        "high":   round(float(row["High"]), 4),
+                        "low":    round(float(row["Low"]), 4),
+                        "close":  round(float(row["Close"]), 4),
+                        "volume": int(row["Volume"]),
+                    }
+                    for ts, row in hist.iterrows()
+                ],
+            }
+    except Exception:
+        pass
+
+    return {"symbol": symbol, "source": "none", "bars": [], "error": "no data"}
+
+
+def calc_macd(bars: list, fast: int = 12, slow: int = 26, signal: int = 9) -> dict:
+    """
+    Calculate MACD on a list of bar dicts (each with a 'close' key).
+    Returns macd/signal/histogram series plus a plain-English signal string.
+    Needs at least slow+signal bars (35) to be meaningful.
+    """
+    if len(bars) < slow + signal:
+        return {"error": f"need {slow+signal} bars, got {len(bars)}"}
+
+    closes = pd.Series([b["close"] for b in bars])
+    timestamps = [b["timestamp"] for b in bars]
+
+    ema_fast   = closes.ewm(span=fast,   adjust=False).mean()
+    ema_slow   = closes.ewm(span=slow,   adjust=False).mean()
+    macd_line  = ema_fast - ema_slow
+    sig_line   = macd_line.ewm(span=signal, adjust=False).mean()
+    histogram  = macd_line - sig_line
+
+    last_m, last_s = macd_line.iloc[-1], sig_line.iloc[-1]
+    prev_m, prev_s = macd_line.iloc[-2], sig_line.iloc[-2]
+
+    if prev_m <= prev_s and last_m > last_s:
+        signal_str = "bullish_crossover"
+    elif prev_m >= prev_s and last_m < last_s:
+        signal_str = "bearish_crossover"
+    elif last_m > last_s:
+        signal_str = "bullish_trend"
+    else:
+        signal_str = "bearish_trend"
+
+    return {
+        "timestamps":       timestamps,
+        "macd":             [round(v, 4) for v in macd_line.tolist()],
+        "signal":           [round(v, 4) for v in sig_line.tolist()],
+        "histogram":        [round(v, 4) for v in histogram.tolist()],
+        "signal_str":       signal_str,
+        "macd_value":       round(float(last_m), 4),
+        "signal_value":     round(float(last_s), 4),
+        "histogram_value":  round(float(histogram.iloc[-1]), 4),
+        "above_zero":       bool(last_m > 0),
+    }
 
 
 def get_quote(symbol: str):

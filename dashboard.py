@@ -713,6 +713,104 @@ if _pm_data:
 else:
     st.caption("No significant movers (>0.8%) right now — check back closer to market open.")
 
+# ── 5-min Chart + MACD ────────────────────────────────────────────────────────
+
+if _pm_data:
+    from plotly.subplots import make_subplots
+
+    _ticker_options = [m["ticker"] for m in _pm_data]
+    _selected = st.selectbox("📈 5-min chart + MACD", _ticker_options,
+                             key="intraday_select")
+
+    @st.cache_data(ttl=60)
+    def _load_intraday(sym):
+        try:
+            import research as _r
+            result = _r.get_intraday_bars(sym, minutes=5, lookback_hours=8)
+            bars   = result.get("bars", [])
+            source = result.get("source", "")
+            if len(bars) >= 35:
+                macd = _r.calc_macd(bars)
+            else:
+                macd = {}
+            return bars, macd, source
+        except Exception as e:
+            return [], {}, f"error: {e}"
+
+    _bars, _macd, _src = _load_intraday(_selected)
+
+    if _bars:
+        _ts    = [b["timestamp"] for b in _bars]
+        _opens = [b["open"]  for b in _bars]
+        _highs = [b["high"]  for b in _bars]
+        _lows  = [b["low"]   for b in _bars]
+        _cls   = [b["close"] for b in _bars]
+
+        _has_macd = "macd" in _macd and len(_macd["macd"]) == len(_bars)
+
+        _rows = 2 if _has_macd else 1
+        _fig_intra = make_subplots(
+            rows=_rows, cols=1, shared_xaxes=True,
+            row_heights=[0.65, 0.35] if _has_macd else [1],
+            vertical_spacing=0.04,
+        )
+
+        _fig_intra.add_trace(go.Candlestick(
+            x=_ts, open=_opens, high=_highs, low=_lows, close=_cls,
+            increasing_line_color="#48bb78", decreasing_line_color="#fc8181",
+            increasing_fillcolor="#48bb78", decreasing_fillcolor="#fc8181",
+            name="Price", showlegend=False,
+        ), row=1, col=1)
+
+        if _has_macd:
+            _hvals = _macd["histogram"]
+            _fig_intra.add_trace(go.Bar(
+                x=_ts, y=_hvals,
+                marker_color=["#48bb78" if v >= 0 else "#fc8181" for v in _hvals],
+                name="Histogram", showlegend=False,
+            ), row=2, col=1)
+            _fig_intra.add_trace(go.Scatter(
+                x=_ts, y=_macd["macd"],
+                line=dict(color="#90cdf4", width=1.5),
+                name="MACD", showlegend=False,
+            ), row=2, col=1)
+            _fig_intra.add_trace(go.Scatter(
+                x=_ts, y=_macd["signal"],
+                line=dict(color="#f6ad55", width=1.5, dash="dot"),
+                name="Signal", showlegend=False,
+            ), row=2, col=1)
+
+        _fig_intra.update_layout(
+            height=420 if _has_macd else 280,
+            margin=dict(l=0, r=0, t=8, b=4),
+            paper_bgcolor="rgba(0,0,0,0)",
+            plot_bgcolor="rgba(0,0,0,0)",
+            font=dict(color="#e2e8f0", size=11),
+            xaxis_rangeslider_visible=False,
+        )
+        _fig_intra.update_xaxes(gridcolor="#2d3748", showgrid=True)
+        _fig_intra.update_yaxes(gridcolor="#2d3748", showgrid=True)
+
+        st.plotly_chart(_fig_intra, use_container_width=True,
+                        config={"staticPlot": True})
+
+        # MACD verdict
+        if _has_macd:
+            _sig = _macd.get("signal_str", "")
+            _verdicts = {
+                "bullish_crossover": ("🟢", "MACD bullish crossover — momentum just turned up"),
+                "bearish_crossover": ("🔴", "MACD bearish crossover — momentum just turned down"),
+                "bullish_trend":     ("🔵", "MACD above signal — uptrend in progress"),
+                "bearish_trend":     ("⚪", "MACD below signal — downtrend in progress"),
+            }
+            _icon, _text = _verdicts.get(_sig, ("⚪", _sig))
+            _zero = "above zero" if _macd.get("above_zero") else "below zero"
+            st.caption(f"{_icon} **{_selected}** — {_text} · MACD {_zero}")
+            if _src == "yfinance_delayed":
+                st.caption("⚠️ Using yfinance fallback (15-min delay) — Alpaca returned no IEX data")
+    else:
+        st.caption(f"No intraday data available for {_selected} yet.")
+
 st.markdown("---")
 
 # ── Daily Options Play ────────────────────────────────────────────────────────
