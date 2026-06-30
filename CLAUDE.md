@@ -34,11 +34,20 @@ These are enforced in code in `scripts/trade.py` via `validate_order()`. The val
 8. **Weekly loss circuit breaker: if account drops 8% in a week, halt all new trades and write a journal entry requesting human review**
 
 ### What You Can and Cannot Trade
-9. **Long-only.** No short selling. No options. No crypto. No leveraged ETFs (TQQQ, SQQQ, SOXL, etc.).
+9. **No options, no crypto, no leveraged ETFs** (TQQQ, SQQQ, SOXL, etc.). Short selling **is permitted** on paper account — see rules below.
 10. **Liquidity filter:** Stock must have minimum 1M average daily volume
 11. **Price filter:** $5 < price < $500 (avoid penny stocks and fractional-share complications)
 12. **Market cap filter:** Minimum $1B market cap (avoid micro-caps with manipulation risk)
 13. **No earnings gambles:** Do NOT open new positions in stocks reporting earnings in the next 3 trading days
+
+### Short Selling Rules
+- **SHORT setups only:** below MA50 (downtrend confirmed) + RSI > 55 (still room to fall) + bearish catalyst (downgrade, guidance cut, sector rotation, technical breakdown)
+- **Stop above entry:** place stop-loss 3–8% above entry limit (same % bands as longs). Day-trade shorts: 0.5–2% above entry
+- **Target below entry:** minimum 1.5:1 R:R (risk = stop_price - entry, reward = entry - target_price)
+- **Position sizing identical to longs:** max 10% of account, min $50, same cash reserve rules
+- **Earnings blackout applies to shorts too:** no opening a short within 3 days of earnings (gap-up risk)
+- **Same leveraged ETF exclusion:** SQQQ and SOXS are leveraged — forbidden. Short individual names or sector ETFs (XLF, XLE) only
+- **Circuit breakers apply equally:** daily -3% or weekly -8% loss halts all new trades including shorts
 
 ### Day Trading Rules (PDT rule eliminated June 4, 2026 — FINRA Regulatory Notice 26-10)
 14. **Day trades are now unrestricted by count.** The $25k PDT minimum was eliminated. No day-trade counting required.
@@ -89,8 +98,10 @@ Then assess:
 
 ### Step 5: Generate Decision
 For each candidate, output ONE of:
-- **BUY** with: ticker, share quantity, entry limit price, stop-loss price, take-profit price, confidence (LOW/MEDIUM/HIGH), thesis (2-3 sentences)
+- **BUY** with: ticker, share quantity, entry limit price, stop-loss price (below entry), take-profit price (above entry), confidence (LOW/MEDIUM/HIGH), thesis (2-3 sentences)
+- **SHORT** with: ticker, share quantity, entry limit price, stop-loss price (**above** entry), take-profit price (**below** entry), confidence, thesis (2-3 sentences)
 - **SELL** with: ticker, share quantity, reason (stop hit / target hit / thesis broken / better opportunity)
+- **COVER** with: ticker, share quantity, reason (stop hit / target hit / thesis broken)
 - **HOLD** with: ticker, current P&L, reason for continuing to hold
 - **NO TRADE** with: reason
 

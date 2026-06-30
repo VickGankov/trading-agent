@@ -244,13 +244,63 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
             return False, f"Would breach cash reserve: {cash_reserve_pct:.2f}% (min {MIN_CASH_RESERVE_PCT}%)"
     
     elif side == "sell":
-        # Must have an existing position
+        # Must have an existing long position
         existing = {p["symbol"]: float(p["qty"]) for p in state["positions"]}
         if symbol not in existing:
             return False, f"Cannot sell {symbol} — no open position"
         if qty > existing[symbol]:
             return False, f"Cannot sell {qty} {symbol} — only {existing[symbol]} held"
-    
+
+    elif side == "short":
+        if limit_price is None:
+            return False, "SHORT orders must specify a limit price"
+        if stop_price is None or target_price is None:
+            return False, "SHORT orders must include both stop_loss and take_profit"
+        if stop_price <= limit_price:
+            return False, "Stop price must be ABOVE entry for short positions"
+        if target_price >= limit_price:
+            return False, "Target price must be BELOW entry for short positions"
+
+        if limit_price < MIN_PRICE or limit_price > MAX_PRICE:
+            return False, f"Price {limit_price} outside allowed range ${MIN_PRICE}-${MAX_PRICE}"
+
+        # Stop placement — above entry for shorts (same % rules as longs)
+        stop_pct = ((stop_price - limit_price) / limit_price) * 100
+        min_stop = 0.5 if is_day_trade else MIN_STOP_PCT
+        max_stop = 2.0 if is_day_trade else MAX_STOP_PCT
+        if stop_pct < min_stop:
+            return False, f"Stop too tight: {stop_pct:.2f}% above entry (min {min_stop}%)"
+        if stop_pct > max_stop:
+            return False, f"Stop too wide: {stop_pct:.2f}% above entry (max {max_stop}%)"
+
+        # Risk/reward (shorts: risk = stop - entry, reward = entry - target)
+        risk = stop_price - limit_price
+        reward = limit_price - target_price
+        if reward / risk < MIN_RR_RATIO:
+            return False, f"R:R too low: {reward/risk:.2f} (min {MIN_RR_RATIO})"
+
+        # Position size
+        order_value = qty * limit_price
+        position_pct = (order_value / state["equity"]) * 100
+        if order_value < MIN_POSITION_USD:
+            return False, f"Position too small: ${order_value:.2f} (min ${MIN_POSITION_USD})"
+        if position_pct > MAX_POSITION_PCT + POSITION_EPSILON_PCT:
+            return False, f"Position too large: {position_pct:.2f}% (max {MAX_POSITION_PCT}%)"
+
+        existing_symbols = {p["symbol"] for p in state["positions"]}
+        if symbol not in existing_symbols and len(state["positions"]) >= MAX_CONCURRENT_POSITIONS:
+            return False, f"Max {MAX_CONCURRENT_POSITIONS} concurrent positions reached"
+
+    elif side == "cover":
+        # Close an existing short position
+        existing = {p["symbol"]: float(p["qty"]) for p in state["positions"]}
+        if symbol not in existing:
+            return False, f"Cannot cover {symbol} — no open short position"
+        if existing[symbol] >= 0:
+            return False, f"Cannot cover {symbol} — not a short (qty={existing[symbol]})"
+        if qty > abs(existing[symbol]):
+            return False, f"Cannot cover {qty} {symbol} — only {abs(existing[symbol])} shorted"
+
     else:
         return False, f"Invalid side: {side}"
     
@@ -328,6 +378,81 @@ def place_sell(symbol: str, qty: float, reason: str):
             "order_id": str(order.id),
             "symbol": symbol,
             "side": "sell",
+            "qty": qty,
+            "reason": reason,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"status": "ERROR", "error": str(e), "symbol": symbol}
+
+
+def place_short(symbol: str, qty: float, limit_price: float, stop_price: float,
+                target_price: float, reason: str, is_day_trade: bool = False):
+    """Open a short position via a SELL limit bracket order (stop buy + target buy above/below entry)."""
+    valid, msg = validate_order(symbol, "short", qty, limit_price, stop_price, target_price,
+                                is_day_trade=is_day_trade)
+    if not valid:
+        return {"status": "REJECTED", "reason": msg, "symbol": symbol, "side": "short", "qty": qty}
+
+    is_fractional = (qty % 1) != 0
+
+    try:
+        trading = get_trading_client()
+        if is_fractional:
+            order = trading.submit_order(LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(limit_price, 2),
+            ))
+        else:
+            order = trading.submit_order(LimitOrderRequest(
+                symbol=symbol,
+                qty=qty,
+                side=OrderSide.SELL,
+                time_in_force=TimeInForce.DAY,
+                limit_price=round(limit_price, 2),
+                order_class=OrderClass.BRACKET,
+                stop_loss=StopLossRequest(stop_price=round(stop_price, 2)),
+                take_profit=TakeProfitRequest(limit_price=round(target_price, 2))
+            ))
+        return {
+            "status": "SUBMITTED",
+            "order_id": str(order.id),
+            "symbol": symbol,
+            "side": "short",
+            "qty": qty,
+            "limit_price": limit_price,
+            "stop_loss": stop_price,
+            "take_profit": target_price,
+            "order_type": "simple_limit" if is_fractional else "bracket",
+            "reason": reason,
+            "timestamp": datetime.now().isoformat()
+        }
+    except Exception as e:
+        return {"status": "ERROR", "error": str(e), "symbol": symbol}
+
+
+def place_cover(symbol: str, qty: float, reason: str):
+    """Close a short position (buy-to-cover market order)."""
+    valid, msg = validate_order(symbol, "cover", qty, None, None, None)
+    if not valid:
+        return {"status": "REJECTED", "reason": msg, "symbol": symbol, "side": "cover", "qty": qty}
+
+    try:
+        trading = get_trading_client()
+        order = trading.submit_order(MarketOrderRequest(
+            symbol=symbol,
+            qty=qty,
+            side=OrderSide.BUY,
+            time_in_force=TimeInForce.DAY
+        ))
+        return {
+            "status": "SUBMITTED",
+            "order_id": str(order.id),
+            "symbol": symbol,
+            "side": "cover",
             "qty": qty,
             "reason": reason,
             "timestamp": datetime.now().isoformat()

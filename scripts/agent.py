@@ -72,28 +72,31 @@ CLAUDE_MD = Path(__file__).parent.parent / "CLAUDE.md"
 WATCHLIST_PATH = Path(__file__).parent.parent / "data" / "watchlist.json"
 
 # Condensed system prompt for Groq (stays under 12K TPM free tier limit)
-GROQ_SYSTEM = """Disciplined paper trading agent. $1000 account.
-Rules: long-only, max $100/position (10%), min $50 order, max 5 open, keep $250+ cash.
-Every BUY: stop 4-6% below entry_limit, target 8-12% above entry_limit. No leveraged ETFs.
+GROQ_SYSTEM = """Disciplined paper trading agent. $1000 paper account.
+Rules: max $100/position (10%), min $50 order, max 5 open, keep $250+ cash. No options, no crypto, no leveraged ETFs.
 
-entry_limit MUST be current_price + 0.3% (round to 2 decimals). Never set below current_price — it will expire unfilled.
+BUY entry_limit = current_price + 0.3% (round to 2 decimals). SHORT entry_limit = current_price - 0.3%.
 Fractional qty: floor(100 / entry_limit * 100) / 100. Verify qty × entry_limit ≥ $50.
 
 OUTPUT BUY when one setup applies and no rejection fires:
-  A. MA20 PULLBACK — price within 4% above MA20, RSI 38-60, above MA50. No news required.
-  B. OVERSOLD BOUNCE — RSI < 42, above MA50. No news required.
-  C. NEWS CATALYST — analyst upgrade/PT raise, earnings beat, product launch + above MA50, any RSI ≤ 65.
+  A. MA20 PULLBACK — price within 4% above MA20, RSI 38-60, above MA50.
+  B. OVERSOLD BOUNCE — RSI < 42, above MA50.
+  C. NEWS CATALYST — analyst upgrade/PT raise, earnings beat, product launch + above MA50, RSI ≤ 65.
 
-REJECT (these override any setup):
-  - RSI > 65 (overbought)
-  - Earnings ≤ 3 days away
-  - Below MA50 (downtrend — no catching falling knives)
+OUTPUT SHORT when one setup applies and no rejection fires:
+  D. BREAKDOWN — below MA50 AND below MA20, RSI > 55 (not yet oversold), bearish catalyst.
+  E. OVERBOUGHT FADE — RSI > 70, below MA50, analyst downgrade or guidance cut.
 
-If a setup matches and no rejection fires → lean BUY. Do not invent extra reasons to pass.
+REJECT for BUY: RSI > 65 | earnings ≤ 3 days | below MA50.
+REJECT for SHORT: RSI < 45 (oversold, covering risk) | earnings ≤ 3 days | above MA50.
 
-One JSON per candidate, then 1-sentence reflection:
-{"action":"BUY","ticker":"X","qty":0.00,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"Setup [A/B/C]: <one sentence why>."}
-{"action":"NO TRADE","ticker":"X","reason":"<exact rejection rule: RSI 67 / earnings 2d / below MA50>"}"""
+BUY bracket: stop 4-8% BELOW entry, target 8-12% ABOVE entry (min 1.5:1 R:R).
+SHORT bracket: stop 4-8% ABOVE entry, target 8-12% BELOW entry (min 1.5:1 R:R).
+
+One JSON per candidate:
+{"action":"BUY","ticker":"X","qty":0.00,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"Setup A/B/C: <one sentence>."}
+{"action":"SHORT","ticker":"X","qty":0.00,"entry_limit":0.00,"stop_loss":0.00,"take_profit":0.00,"confidence":"MEDIUM","thesis":"Setup D/E: <one sentence>."}
+{"action":"NO TRADE","ticker":"X","reason":"<exact rejection rule>"}"""
 
 
 def load_system_prompt():
@@ -694,8 +697,34 @@ def _execute_from_text(text: str, account: dict) -> dict:
             # Persist stop level to state.json so remote routines can monitor it
             if result.get("status") == "SUBMITTED" and stop and tgt:
                 trade_module.save_stop_level(ticker, stop, tgt, entry)
+        elif action == "SHORT" and ticker:
+            import math
+            raw_qty = float(decision.get("qty", 0))
+            entry = float(decision.get("entry_limit", decision.get("entry", 0)) or 0)
+            qty = math.floor(raw_qty * 100) / 100
+            if entry > 0:
+                qty = min(qty, math.floor((100.0 / entry) * 100) / 100)
+            stop = float(decision.get("stop_loss", decision.get("stop", 0)))
+            tgt  = float(decision.get("take_profit", decision.get("target", 0)))
+            entry = float(decision.get("entry_limit", decision.get("entry", 0)))
+            result = trade_module.place_short(ticker, qty, entry, stop, tgt,
+                                              decision.get("thesis", "agent decision"))
+            print(f"\n→ ORDER: {json.dumps(result)}")
+            results[ticker] = result
+            if result.get("status") == "SUBMITTED" and stop and tgt:
+                trade_module.save_stop_level(ticker, stop, tgt, entry)
         elif action == "SELL" and ticker:
             result = trade_module.place_sell(
+                ticker,
+                round(float(decision.get("qty", 0)), 2),
+                decision.get("reason", "agent decision")
+            )
+            print(f"\n→ ORDER: {json.dumps(result)}")
+            results[ticker] = result
+            if result.get("status") == "SUBMITTED":
+                trade_module.remove_stop_level(ticker)
+        elif action == "COVER" and ticker:
+            result = trade_module.place_cover(
                 ticker,
                 round(float(decision.get("qty", 0)), 2),
                 decision.get("reason", "agent decision")
@@ -732,6 +761,24 @@ def _validate_from_text(text: str) -> dict:
                 "qty": qty,
             }
             print(f"\n→ DRY RUN VALIDATION: {ticker} buy qty={qty} @ {entry}: {msg}")
+        elif action == "SHORT" and ticker:
+            raw_qty = float(decision.get("qty", 0))
+            entry = float(decision.get("entry_limit", decision.get("entry", 0)) or 0)
+            qty = math.floor(raw_qty * 100) / 100
+            if entry > 0:
+                qty = min(qty, math.floor((100.0 / entry) * 100) / 100)
+            stop = float(decision.get("stop_loss", decision.get("stop", 0)))
+            tgt = float(decision.get("take_profit", decision.get("target", 0)))
+            valid, msg = trade_module.validate_order(ticker, "short", qty, entry, stop, tgt)
+            results[ticker] = {
+                "status": "DRY_RUN",
+                "would_be_valid": valid,
+                "validation_msg": msg,
+                "symbol": ticker,
+                "side": "short",
+                "qty": qty,
+            }
+            print(f"\n→ DRY RUN VALIDATION: {ticker} short qty={qty} @ {entry}: {msg}")
         elif action == "SELL" and ticker:
             qty = round(float(decision.get("qty", 0)), 2)
             valid, msg = trade_module.validate_order(ticker, "sell", qty, None, None, None)
@@ -744,6 +791,18 @@ def _validate_from_text(text: str) -> dict:
                 "qty": qty,
             }
             print(f"\n→ DRY RUN VALIDATION: {ticker} sell qty={qty}: {msg}")
+        elif action == "COVER" and ticker:
+            qty = round(float(decision.get("qty", 0)), 2)
+            valid, msg = trade_module.validate_order(ticker, "cover", qty, None, None, None)
+            results[ticker] = {
+                "status": "DRY_RUN",
+                "would_be_valid": valid,
+                "validation_msg": msg,
+                "symbol": ticker,
+                "side": "cover",
+                "qty": qty,
+            }
+            print(f"\n→ DRY RUN VALIDATION: {ticker} cover qty={qty}: {msg}")
     return results
 
 
