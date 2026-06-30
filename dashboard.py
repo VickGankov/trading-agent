@@ -40,7 +40,7 @@ st.set_page_config(
     page_title="Trading Agent",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 st.markdown("""
@@ -240,6 +240,46 @@ st.markdown("""
     /* Color helpers */
     .green { color:#00d4aa; } .red { color:#ff4b4b; }
     .gold  { color:#f6ad55; } .gray { color:#a0aec0; }
+
+    /* Catalyst item row */
+    .catalyst-item {
+        display:flex; flex-wrap:wrap; align-items:baseline;
+        gap:6px 10px; padding:7px 0;
+        border-bottom:1px solid #1e2535;
+        font-size:0.88em; line-height:1.4;
+    }
+    .ci-ticker { font-weight:700; color:#e2e8f0; min-width:44px; }
+    .ci-up     { color:#48bb78; font-weight:600; white-space:nowrap; }
+    .ci-dn     { color:#fc8181; font-weight:600; white-space:nowrap; }
+    .ci-headline { color:#a0aec0; flex:1; min-width:180px; }
+
+    /* MACD verdict pill */
+    .macd-verdict {
+        border-radius:6px; padding:10px 14px;
+        margin:8px 0; font-size:0.9em; line-height:1.5;
+        border-left-width:3px; border-left-style:solid;
+    }
+
+    /* ── Mobile responsive ──────────────────────────────── */
+    @media (max-width: 768px) {
+        .main .block-container {
+            padding: 0.75rem 0.75rem 2rem !important;
+            max-width: 100vw !important;
+        }
+        section[data-testid="stSidebar"] { display:none !important; }
+        h1 { font-size: 1.5rem !important; }
+        h2, [data-testid="stHeading"] { font-size: 1.1rem !important; }
+        .analysis-card  { padding: 12px 14px !important; }
+        .catalyst-box   { padding: 8px 10px !important; }
+        .opts-metric-box { padding: 8px 10px !important; }
+        .opts-metric-value { font-size: 1.05em !important; }
+        .level-box { min-width: calc(50% - 8px) !important; }
+        .tech-box  { min-width: calc(50% - 6px) !important; }
+        [data-testid="stMetricValue"] { font-size: 1.1em !important; }
+        [data-testid="stMetricLabel"] { font-size: 0.62em !important; }
+        [data-testid="stDataFrame"]   { overflow-x: auto !important; }
+        .ci-headline { min-width: 100% !important; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -702,12 +742,18 @@ if _pm_data:
     _headlined = [m for m in _pm_data if m.get("headline")]
     if _headlined:
         st.caption("**Catalysts**")
+        _cat_html = ""
         for m in _headlined:
-            _clr = "green" if m["change_pct"] > 0 else "red"
-            _tc, _pc, _hc = st.columns([1, 1, 9])
-            _tc.markdown(f"**{m['ticker']}**")
-            _pc.markdown(f":{_clr}[{m['change_pct']:+.1f}%]")
-            _hc.caption(m["headline"])
+            _chg_cls = "ci-up" if m["change_pct"] > 0 else "ci-dn"
+            _arrow   = "▲" if m["change_pct"] > 0 else "▼"
+            _cat_html += (
+                f'<div class="catalyst-item">'
+                f'<span class="ci-ticker">{m["ticker"]}</span>'
+                f'<span class="{_chg_cls}">{_arrow} {m["change_pct"]:+.1f}%</span>'
+                f'<span class="ci-headline">{m["headline"]}</span>'
+                f'</div>'
+            )
+        st.markdown(_cat_html, unsafe_allow_html=True)
     else:
         st.caption("No news catalysts found via Alpaca for current movers.")
 else:
@@ -798,16 +844,20 @@ if _pm_data:
         if _has_macd:
             _sig = _macd.get("signal_str", "")
             _verdicts = {
-                "bullish_crossover": ("🟢", "MACD bullish crossover — momentum just turned up"),
-                "bearish_crossover": ("🔴", "MACD bearish crossover — momentum just turned down"),
-                "bullish_trend":     ("🔵", "MACD above signal — uptrend in progress"),
-                "bearish_trend":     ("⚪", "MACD below signal — downtrend in progress"),
+                "bullish_crossover": ("🟢", "Bullish crossover — momentum just turned up",  "#1a3a2a", "#48bb78"),
+                "bearish_crossover": ("🔴", "Bearish crossover — momentum just turned down", "#3a1a1a", "#fc8181"),
+                "bullish_trend":     ("🔵", "Above signal line — uptrend in progress",       "#1a2a3a", "#90cdf4"),
+                "bearish_trend":     ("⚪", "Below signal line — downtrend in progress",     "#1e2130", "#718096"),
             }
-            _icon, _text = _verdicts.get(_sig, ("⚪", _sig))
-            _zero = "above zero" if _macd.get("above_zero") else "below zero"
-            st.caption(f"{_icon} **{_selected}** — {_text} · MACD {_zero}")
+            _icon, _text, _bg, _border = _verdicts.get(_sig, ("⚪", _sig, "#1e2130", "#718096"))
+            _zero = "MACD above zero ✓" if _macd.get("above_zero") else "MACD below zero"
+            st.markdown(
+                f'<div class="macd-verdict" style="background:{_bg};border-left-color:{_border}">'
+                f'{_icon} <strong>{_selected}</strong> — {_text} &nbsp;·&nbsp; {_zero}</div>',
+                unsafe_allow_html=True,
+            )
             if _src == "yfinance_delayed":
-                st.caption("⚠️ Using yfinance fallback (15-min delay) — Alpaca returned no IEX data")
+                st.caption("⚠️ Alpaca returned no IEX data — using yfinance (15-min delay)")
     else:
         st.caption(f"No intraday data available for {_selected} yet.")
 
@@ -1490,13 +1540,14 @@ if account_data:
     pnl       = equity - 1000.0
     market_open = market_data.get("is_open", False) if isinstance(market_data, dict) else False
 
-    col1, col2, col3, col4, col5, col6 = st.columns(6)
+    col1, col2, col3 = st.columns(3)
     col1.metric("Portfolio Value", f"${equity:,.2f}",
                 delta=f"{pnl:+.2f} vs start",
                 delta_color="normal" if pnl >= 0 else "inverse")
     col2.metric("Cash", f"${cash:,.2f}", f"{cash_pct:.0f}% of equity",
                 delta_color="off")
     col3.metric("Positions", f"{n_pos} / 5")
+    col4, col5, col6 = st.columns(3)
     col4.metric("Day Trades (5d)", f"{daytrades} / 3",
                 delta="⚠️ Near PDT limit" if daytrades >= 2 else None,
                 delta_color="inverse" if daytrades >= 2 else "normal")
@@ -1641,7 +1692,8 @@ if not eq_df.empty and len(eq_df) > 1:
 st.subheader(f"Cycle Stats — Last {days_filter} Days")
 stats = compute_stats(journal_entries)
 
-c1, c2, c3, c4, c5 = st.columns(5)
+c1, c2, c3 = st.columns(3)
+c4, c5, _  = st.columns(3)
 c1.metric("Cycles Run",     stats["total_cycles"])
 c2.metric("Orders Submitted",  stats["submitted"],
           help="BUY/SELL decisions with execution_status=SUBMITTED")
@@ -1817,7 +1869,8 @@ else:
     total_pnl  = perf["total_pnl"]
     all_trades = perf["all_trades"]
 
-    m1, m2, m3, m4, m5 = st.columns(5)
+    m1, m2, m3 = st.columns(3)
+    m4, m5, _  = st.columns(3)
     m1.metric("Completed", total)
     m2.metric("Open", open_cnt)
     m3.metric("Win Rate", f"{win_rate}%" if total else "—")
