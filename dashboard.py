@@ -40,7 +40,7 @@ st.set_page_config(
     page_title="Trading Agent",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="collapsed"
 )
 
 st.markdown("""
@@ -240,44 +240,57 @@ st.markdown("""
     /* Color helpers */
     .green { color:#00d4aa; } .red { color:#ff4b4b; }
     .gold  { color:#f6ad55; } .gray { color:#a0aec0; }
+
+    /* Hide sidebar globally — controls are inline */
+    section[data-testid="stSidebar"],
+    [data-testid="collapsedControl"] { display:none !important; }
+
+    /* Catalyst headline flex rows */
+    .catalyst-item {
+        display:flex; flex-wrap:wrap; align-items:baseline;
+        gap:6px 10px; padding:7px 0;
+        border-bottom:1px solid #1e2535;
+        font-size:0.88em; line-height:1.4;
+    }
+    .ci-ticker { font-weight:700; color:#e2e8f0; min-width:44px; }
+    .ci-up     { color:#48bb78; font-weight:600; white-space:nowrap; }
+    .ci-dn     { color:#fc8181; font-weight:600; white-space:nowrap; }
+    .ci-headline { color:#a0aec0; flex:1; min-width:180px; }
+
+    /* MACD verdict pill */
+    .macd-verdict {
+        border-radius:6px; padding:10px 14px;
+        margin:8px 0; font-size:0.9em; line-height:1.5;
+        border-left-width:3px; border-left-style:solid;
+    }
+
+    /* Mobile */
+    @media (max-width: 768px) {
+        .main .block-container { padding:0.75rem 0.75rem 2rem !important; max-width:100vw !important; }
+        h1 { font-size:1.5rem !important; }
+        h2, [data-testid="stHeading"] { font-size:1.1rem !important; }
+        .analysis-card  { padding:12px 14px !important; }
+        .catalyst-box   { padding:8px 10px !important; }
+        .opts-metric-box { padding:8px 10px !important; }
+        .opts-metric-value { font-size:1.05em !important; }
+        .level-box { min-width:calc(50% - 8px) !important; }
+        .tech-box  { min-width:calc(50% - 6px) !important; }
+        [data-testid="stMetricValue"] { font-size:1.1em !important; }
+        [data-testid="stMetricLabel"] { font-size:0.62em !important; }
+        [data-testid="stDataFrame"]   { overflow-x:auto !important; }
+        .ci-headline { min-width:100% !important; }
+    }
 </style>
 """, unsafe_allow_html=True)
 
-# ── Sidebar ───────────────────────────────────────────────────────────────────
+# ── Session state defaults (replaces sidebar) ─────────────────────────────────
 
-with st.sidebar:
-    st.title("⚙️ Controls")
-
-    if st.button("🔄 Refresh Data", use_container_width=True):
-        st.cache_data.clear()
-        st.rerun()
-
-    auto_refresh = st.toggle("Auto-refresh (60s)", value=False)
-
-    st.divider()
-    st.markdown("**Run Agent**")
-
-    col_a, col_b = st.columns(2)
-    run_live = col_a.button("▶ Live", use_container_width=True, help="Run a full trading cycle")
-    run_dry  = col_b.button("🔍 Dry Run", use_container_width=True, help="Analyze without placing orders")
-
-    if run_live or run_dry:
-        flag = "" if run_live else "--dry-run"
-        cmd = [PYTHON, str(SCRIPTS_DIR / "agent.py")] + ([flag] if flag else [])
-        with st.spinner("Running cycle… (up to 3 min)"):
-            result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
-        if result.returncode == 0:
-            st.success("Cycle complete")
-            st.text_area("Output", result.stdout[-3000:], height=200)
-        else:
-            st.error("Cycle failed")
-            st.text_area("Error", (result.stderr or result.stdout)[-2000:], height=200)
-        st.cache_data.clear()
-
-    st.divider()
-    days_filter = st.slider("Journal lookback (days)", 1, 30, 7)
-    st.divider()
-    st.caption("**Paper Trading Only** — simulated capital")
+if "_auto_refresh" not in st.session_state:
+    st.session_state["_auto_refresh"] = False
+if "_days_filter" not in st.session_state:
+    st.session_state["_days_filter"] = 7
+auto_refresh = st.session_state["_auto_refresh"]
+days_filter  = st.session_state["_days_filter"]
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
 
@@ -373,6 +386,22 @@ def load_journal_entries(days: int = 7):
         except Exception:
             continue
     return entries
+
+
+@st.cache_data(ttl=60)
+def _load_intraday(sym):
+    try:
+        import research as _r
+        result = _r.get_intraday_bars(sym, minutes=5, lookback_hours=8)
+        bars   = result.get("bars", [])
+        source = result.get("source", "")
+        if len(bars) >= 35:
+            macd = _r.calc_macd(bars)
+        else:
+            macd = {}
+        return bars, macd, source
+    except Exception as e:
+        return [], {}, f"error: {e}"
 
 
 def get_stop_target_from_journal(entries: list) -> dict:
@@ -661,7 +690,7 @@ stop_levels = load_active_stop_levels(
 
 st.title("📈 Trading Agent")
 
-tab1, tab2, tab3, tab4 = st.tabs(["🌅 Pre-Market", "🎯 Options", "🔍 Analysis", "💼 Account"])
+tab1, tab2, tab3, tab4 = st.tabs(["🌅 Pre-Market", "🎯 Options", "🔍 Analysis", "📊 Portfolio"])
 
 with tab1:
     # ── Pre-Market Movers ─────────────────────────────────────────────────────
@@ -715,6 +744,87 @@ with tab1:
             st.caption("No news catalysts found via Alpaca for current movers.")
     else:
         st.caption("No significant movers (>0.8%) right now — check back closer to market open.")
+
+    # ── 5-min Chart + MACD ───────────────────────────────────────────────────
+    if _pm_data:
+        from plotly.subplots import make_subplots
+
+        _ticker_options = [m["ticker"] for m in _pm_data]
+        _selected = st.selectbox("📈 5-min chart + MACD", _ticker_options,
+                                 key="intraday_select")
+
+        _bars, _macd, _src = _load_intraday(_selected)
+
+        if _bars:
+            _ts    = [b["timestamp"] for b in _bars]
+            _opens = [b["open"]  for b in _bars]
+            _highs = [b["high"]  for b in _bars]
+            _lows  = [b["low"]   for b in _bars]
+            _cls   = [b["close"] for b in _bars]
+
+            _has_macd = "macd" in _macd and len(_macd["macd"]) == len(_bars)
+
+            _rows = 2 if _has_macd else 1
+            _fig_intra = make_subplots(
+                rows=_rows, cols=1, shared_xaxes=True,
+                row_heights=[0.65, 0.35] if _has_macd else [1],
+                vertical_spacing=0.04,
+            )
+            _fig_intra.add_trace(go.Candlestick(
+                x=_ts, open=_opens, high=_highs, low=_lows, close=_cls,
+                increasing_line_color="#48bb78", decreasing_line_color="#fc8181",
+                increasing_fillcolor="#48bb78", decreasing_fillcolor="#fc8181",
+                name="Price", showlegend=False,
+            ), row=1, col=1)
+            if _has_macd:
+                _hvals = _macd["histogram"]
+                _fig_intra.add_trace(go.Bar(
+                    x=_ts, y=_hvals,
+                    marker_color=["#48bb78" if v >= 0 else "#fc8181" for v in _hvals],
+                    name="Histogram", showlegend=False,
+                ), row=2, col=1)
+                _fig_intra.add_trace(go.Scatter(
+                    x=_ts, y=_macd["macd"],
+                    line=dict(color="#90cdf4", width=1.5),
+                    name="MACD", showlegend=False,
+                ), row=2, col=1)
+                _fig_intra.add_trace(go.Scatter(
+                    x=_ts, y=_macd["signal"],
+                    line=dict(color="#f6ad55", width=1.5, dash="dot"),
+                    name="Signal", showlegend=False,
+                ), row=2, col=1)
+            _fig_intra.update_layout(
+                height=420 if _has_macd else 280,
+                margin=dict(l=0, r=0, t=8, b=4),
+                paper_bgcolor="rgba(0,0,0,0)",
+                plot_bgcolor="rgba(0,0,0,0)",
+                font=dict(color="#e2e8f0", size=11),
+                xaxis_rangeslider_visible=False,
+            )
+            _fig_intra.update_xaxes(gridcolor="#2d3748", showgrid=True)
+            _fig_intra.update_yaxes(gridcolor="#2d3748", showgrid=True)
+            st.plotly_chart(_fig_intra, use_container_width=True,
+                            config={"staticPlot": True})
+
+            if _has_macd:
+                _sig = _macd.get("signal_str", "")
+                _verdicts = {
+                    "bullish_crossover": ("🟢", "Bullish crossover — momentum just turned up",  "#1a3a2a", "#48bb78"),
+                    "bearish_crossover": ("🔴", "Bearish crossover — momentum just turned down", "#3a1a1a", "#fc8181"),
+                    "bullish_trend":     ("🔵", "Above signal line — uptrend in progress",       "#1a2a3a", "#90cdf4"),
+                    "bearish_trend":     ("⚪", "Below signal line — downtrend in progress",     "#1e2130", "#718096"),
+                }
+                _icon, _text, _bg, _border = _verdicts.get(_sig, ("⚪", _sig, "#1e2130", "#718096"))
+                _zero = "MACD above zero ✓" if _macd.get("above_zero") else "MACD below zero"
+                st.markdown(
+                    f'<div class="macd-verdict" style="background:{_bg};border-left-color:{_border}">'
+                    f'{_icon} <strong>{_selected}</strong> — {_text} &nbsp;·&nbsp; {_zero}</div>',
+                    unsafe_allow_html=True,
+                )
+                if _src == "yfinance_delayed":
+                    st.caption("⚠️ Alpaca returned no IEX data — using yfinance (15-min delay)")
+        else:
+            st.caption(f"No intraday data available for {_selected} yet.")
 
 with tab2:
     # ── Daily Options Play ────────────────────────────────────────────────────
@@ -936,6 +1046,52 @@ with tab2:
                         st.markdown(f"<span style='color:#a0aec0;font-size:0.9em'>• {h}</span>",
                                     unsafe_allow_html=True)
 
+
+    # ── Options Outcome Tracker ───────────────────────────────────────────────────
+
+    st.divider()
+    st.subheader("📊 Options Track Record")
+
+    if not _OUTCOMES_AVAILABLE:
+        st.caption("outcomes.py not loaded — run from trading-agent directory.")
+    else:
+        _oc_hdr, _oc_btn = st.columns([5, 1])
+        _oc_hdr.caption("Track whether AI options picks played out.")
+        if _oc_btn.button("🔄 Check Expired", use_container_width=True, key="check_exp_tab2"):
+            _updated = _outcomes_mod.update_expired_trades()
+            if _updated:
+                st.success(f"Updated {len(_updated)} expired trade(s).")
+            else:
+                st.info("No newly expired trades.")
+
+        _perf = _outcomes_mod.get_performance_stats()
+        _m1, _m2, _m3, _m4, _m5 = st.columns(5)
+        _m1.metric("Completed",  _perf["total"])
+        _m2.metric("Open",       _perf["open"])
+        _m3.metric("Win Rate",   f"{_perf['win_rate']}%" if _perf["total"] else "—")
+        _m4.metric("Avg Return", f"{_perf['avg_return']:+.1f}%" if _perf["total"] else "—")
+        _m5.metric("Total P&L",  f"${_perf['total_pnl']:+.0f}" if _perf["total"] else "—")
+
+        if _perf["all_trades"]:
+            _rows_ot = []
+            _oicons = {"win": "✅", "loss": "❌", "breakeven": "➖", "pending": "⏳"}
+            for _t in _perf["all_trades"][:20]:
+                _oc  = _t.get("outcome") or ""
+                _pnl = _t.get("profit_loss")
+                _ret = _t.get("return_pct")
+                _rows_ot.append({
+                    "": _oicons.get(_oc, "🔵"),
+                    "Date":     _t.get("date", ""),
+                    "Ticker":   _t.get("ticker", ""),
+                    "Strategy": _t.get("strategy", "").replace("_", " ").title(),
+                    "Conf":     _t.get("confidence", ""),
+                    "Expiry":   _t.get("expiration", ""),
+                    "P&L":      f"${_pnl:+.0f}" if _pnl is not None else "—",
+                    "Return":   f"{_ret:+.1f}%" if _ret is not None else "—",
+                })
+            st.dataframe(pd.DataFrame(_rows_ot), use_container_width=True, hide_index=True)
+        elif _perf["open"] == 0:
+            st.info("No options trades recorded yet. Run Today's Options Play to start tracking.")
 
 with tab3:
     st.subheader("🔍 Symbol Analysis")
@@ -1361,6 +1517,35 @@ with tab3:
 
 
 with tab4:
+    # ── Inline agent controls ────────────────────────────────────────────────────
+
+    _ca, _cb, _cc, _cd, _ce = st.columns([2, 2, 3, 1, 1])
+    _run_live = _ca.button("▶ Run Live",  use_container_width=True, type="primary")
+    _run_dry  = _cb.button("◎ Dry Run",   use_container_width=True)
+    _cc.toggle("Auto-refresh (60s)", key="_auto_refresh")
+    _days_filter_val = _cd.number_input("Days", 1, 30,
+                                        st.session_state.get("_days_filter", 7),
+                                        key="_days_filter", label_visibility="visible",
+                                        help="Journal lookback days")
+    days_filter = int(_days_filter_val)
+    if _ce.button("🔄", use_container_width=True, help="Refresh all data"):
+        st.cache_data.clear()
+        st.rerun()
+
+    if _run_live or _run_dry:
+        _flag = "" if _run_live else "--dry-run"
+        _cmd  = [PYTHON, str(SCRIPTS_DIR / "agent.py")] + ([_flag] if _flag else [])
+        with st.spinner("Running cycle… (up to 3 min)"):
+            _res = subprocess.run(_cmd, capture_output=True, text=True, timeout=300)
+        if _res.returncode == 0:
+            st.success("Cycle complete — refresh to see latest positions.")
+        else:
+            _err = (_res.stderr or _res.stdout)[-800:]
+            st.error(f"Cycle failed: {_err}")
+        st.cache_data.clear()
+
+    st.divider()
+
     # ── Header ────────────────────────────────────────────────────────────────────
 
     # Last cycle summary
@@ -1390,24 +1575,21 @@ with tab4:
         equity   = account_data.get("account_value", 0)
         cash     = account_data.get("cash", 0)
         n_pos    = account_data.get("positions_count", 0)
-        daytrades = account_data.get("daytrade_count", 0)
         cash_pct  = (cash / equity * 100) if equity else 0
         pnl       = equity - 1000.0
         market_open = market_data.get("is_open", False) if isinstance(market_data, dict) else False
 
-        col1, col2, col3, col4, col5, col6 = st.columns(6)
-        col1.metric("Portfolio Value", f"${equity:,.2f}",
-                    delta=f"{pnl:+.2f} vs start",
-                    delta_color="normal" if pnl >= 0 else "inverse")
-        col2.metric("Cash", f"${cash:,.2f}", f"{cash_pct:.0f}% of equity",
-                    delta_color="off")
-        col3.metric("Positions", f"{n_pos} / 5")
-        col4.metric("Day Trades (5d)", f"{daytrades} / 3",
-                    delta="⚠️ Near PDT limit" if daytrades >= 2 else None,
-                    delta_color="inverse" if daytrades >= 2 else "normal")
-        col5.metric("Market", "🟢 Open" if market_open else "🔴 Closed",
-                    delta=market_data.get("next_close" if market_open else "next_open", "") if isinstance(market_data, dict) else "")
-        col6.metric("Open Orders", len(open_orders))
+        _r1c1, _r1c2, _r1c3 = st.columns(3)
+        _r2c1, _r2c2, _     = st.columns(3)
+        _r1c1.metric("Portfolio Value", f"${equity:,.2f}",
+                     delta=f"{pnl:+.2f} vs start",
+                     delta_color="normal" if pnl >= 0 else "inverse")
+        _r1c2.metric("Cash", f"${cash:,.2f}", f"{cash_pct:.0f}% of equity",
+                     delta_color="off")
+        _r1c3.metric("Positions", f"{n_pos}")
+        _r2c1.metric("Market", "🟢 Open" if market_open else "🔴 Closed",
+                     delta=market_data.get("next_close" if market_open else "next_open", "") if isinstance(market_data, dict) else "")
+        _r2c2.metric("Open Orders", len(open_orders))
 
         if cash_pct < 25:
             st.warning(f"⚠️ Cash at {cash_pct:.1f}% — below 25% reserve. New buys blocked until cash is restored.")
@@ -1583,184 +1765,9 @@ with tab4:
                               legend=dict(orientation="h"))
             st.plotly_chart(fig, use_container_width=True)
 
-    st.divider()
-
-    # ── Trade History ─────────────────────────────────────────────────────────────
-
-    st.subheader("Trade History")
-
-    trades = extract_trades(journal_entries)
-    if trades:
-        trade_df = pd.DataFrame(trades)
-
-        def color_status(val):
-            mapping = {
-                "SUBMITTED":     "color:#00d4aa;font-weight:600",
-                "REJECTED":      "color:#ff4b4b",
-                "ERROR":         "color:#ff4b4b",
-                "DRY_RUN":       "color:#718096",
-                "DRY_RUN_REJECTED": "color:#ff4b4b",
-                "NOT_SUBMITTED": "color:#718096",
-            }
-            return mapping.get(str(val), "")
-
-        def color_action(val):
-            return "color:#00d4aa;font-weight:600" if val == "BUY" else "color:#ff4b4b;font-weight:600"
-
-        styled = trade_df.style \
-            .applymap(color_status, subset=["Status"]) \
-            .applymap(color_action, subset=["Action"])
-        st.dataframe(styled, use_container_width=True, hide_index=True)
-
-        # Rejection detail expander
-        rejected = [t for t in trades if t["Status"] in ("REJECTED", "ERROR")]
-        if rejected:
-            with st.expander(f"⛔ {len(rejected)} rejection(s) — expand for details"):
-                for r in rejected:
-                    st.markdown(f"**{r['Time']} — {r['Action']} {r['Ticker']}**: {r['Detail'] or 'no detail'}")
-    else:
-        st.info("No trades in the selected period.")
-
-    st.divider()
-
-    # ── Journal Viewer ────────────────────────────────────────────────────────────
-
-    st.subheader("Journal Entries")
-
-    if journal_entries:
-        for entry in journal_entries[:10]:
-            ts       = entry.get("_written_at", entry.get("cycle_timestamp", ""))[:16].replace("T", " ")
-            dry_tag  = " 🔍" if entry.get("dry_run") else ""
-            decisions = entry.get("decisions", [])
-            submitted_d = [d for d in decisions if d.get("execution_status") == "SUBMITTED"]
-            rejected_d  = [d for d in decisions if d.get("execution_status") in ("REJECTED","ERROR")]
-            no_trade_d  = [d for d in decisions if d.get("action") == "NO TRADE"]
-
-            summary = f"{len(submitted_d)} submitted · {len(rejected_d)} rejected · {len(no_trade_d)} no-trade"
-            label   = f"📋 {ts}{dry_tag}  —  {summary}"
-
-            with st.expander(label, expanded=False):
-                # Market context — parse the nested structure from get_market_snapshot()
-                ctx = entry.get("market_context", {})
-                indices = ctx.get("indices", {})
-                spy = indices.get("SPY", {})
-                qqq = indices.get("QQQ", {})
-                iwm = indices.get("IWM", {})
-                if spy or qqq:
-                    cols = st.columns(4)
-                    cols[0].metric("SPY 5d", f"{spy.get('5d_change_pct', 0):+.2f}%" if spy.get('5d_change_pct') is not None else "—")
-                    cols[1].metric("QQQ 5d", f"{qqq.get('5d_change_pct', 0):+.2f}%" if qqq.get('5d_change_pct') is not None else "—")
-                    cols[2].metric("IWM 5d", f"{iwm.get('5d_change_pct', 0):+.2f}%" if iwm.get('5d_change_pct') is not None else "—")
-                    market_status = ctx.get("market_status", {})
-                    cols[3].metric("Market", "🟢 Open" if market_status.get("is_open") else "🔴 Closed")
-
-                # Decisions
-                if decisions:
-                    st.markdown("**Decisions**")
-                    for d in decisions:
-                        action = d.get("action", "")
-                        ticker = d.get("ticker", "")
-                        ex     = d.get("execution_status", "")
-                        icon   = {"BUY":"🟢","SELL":"🔴","HOLD":"🟡","NO TRADE":"⬜"}.get(action, "")
-                        status_badge = {
-                            "SUBMITTED":     "✅",
-                            "REJECTED":      "❌",
-                            "ERROR":         "❌",
-                            "DRY_RUN":       "🔍",
-                            "DRY_RUN_REJECTED": "❌",
-                            "NOT_SUBMITTED": "⏭",
-                            "NO_TRADE":      "",
-                            "HOLD":          "",
-                        }.get(ex, "")
-
-                        line = f"{icon} **{action}** {ticker} {status_badge}"
-                        if action == "BUY":
-                            line += (f" @ ${d.get('entry_limit','')} "
-                                     f"| stop ${d.get('stop_loss','')} "
-                                     f"| target ${d.get('take_profit','')} "
-                                     f"| {d.get('confidence','')}")
-                            if d.get("execution_detail"):
-                                line += f"  ⚠️ _{d['execution_detail']}_"
-                        elif action in ("SELL", "NO TRADE"):
-                            line += f" — {d.get('reason', '')}"
-                        st.markdown(line)
-                        if d.get("thesis"):
-                            st.caption(d["thesis"])
-
-                # Reflection
-                if entry.get("reflection"):
-                    st.markdown("**Reflection**")
-                    st.caption(entry["reflection"])
-
-                with st.expander("Raw JSON"):
-                    st.json(entry)
-    else:
-        st.info(f"No journal entries in the last {days_filter} days.")
-
-    # ── Options Outcome Tracker ───────────────────────────────────────────────────
-
-    st.subheader("📊 Options Outcome Tracker")
-
-    if not _OUTCOMES_AVAILABLE:
-        st.warning("outcomes.py could not be loaded — run from the trading-agent directory.")
-    else:
-        col_ref, col_btn = st.columns([4, 1])
-        with col_btn:
-            if st.button("🔄 Check Expired", use_container_width=True):
-                updated = _outcomes_mod.update_expired_trades()
-                if updated:
-                    st.success(f"Updated {len(updated)} expired trade(s).")
-                else:
-                    st.info("No newly expired trades.")
-
-        perf = _outcomes_mod.get_performance_stats()
-        total      = perf["total"]
-        open_cnt   = perf["open"]
-        win_rate   = perf["win_rate"]
-        avg_ret    = perf["avg_return"]
-        total_pnl  = perf["total_pnl"]
-        all_trades = perf["all_trades"]
-
-        m1, m2, m3, m4, m5 = st.columns(5)
-        m1.metric("Completed", total)
-        m2.metric("Open", open_cnt)
-        m3.metric("Win Rate", f"{win_rate}%" if total else "—")
-        delta_color_ret = "normal" if avg_ret >= 0 else "inverse"
-        m4.metric("Avg Return", f"{avg_ret:+.1f}%" if total else "—")
-        delta_color_pnl = "normal" if total_pnl >= 0 else "inverse"
-        m5.metric("Total P&L", f"${total_pnl:+.0f}" if total else "—")
-
-        if all_trades:
-            rows = []
-            outcome_icons = {"win": "✅", "loss": "❌", "breakeven": "➖", "pending": "⏳"}
-            status_icons  = {"open": "🔵", "expired": ""}
-            for t in all_trades[:20]:
-                outcome = t.get("outcome") or ""
-                status  = t.get("status", "open")
-                icon    = outcome_icons.get(outcome, status_icons.get(status, "🔵"))
-                pnl     = t.get("profit_loss")
-                ret     = t.get("return_pct")
-                rows.append({
-                    "":          icon,
-                    "Date":      t.get("date", ""),
-                    "Ticker":    t.get("ticker", ""),
-                    "Strategy":  t.get("strategy", "").replace("_", " ").title(),
-                    "Dir":       t.get("direction", "").capitalize(),
-                    "Conf":      t.get("confidence", ""),
-                    "Entry $":   f"${t['entry_cost']:.0f}" if t.get("entry_cost") else "—",
-                    "Expiry":    t.get("expiration", ""),
-                    "P&L":       f"${pnl:+.0f}" if pnl is not None else "—",
-                    "Return":    f"{ret:+.1f}%" if ret is not None else "—",
-                    "Source":    t.get("source", "").replace("_", " "),
-                })
-            df_trades = pd.DataFrame(rows)
-            st.dataframe(df_trades, use_container_width=True, hide_index=True)
-        elif open_cnt == 0:
-            st.info("No trades recorded yet. Analyze a symbol to start tracking.")
-
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 
-if auto_refresh:
+if st.session_state.get("_auto_refresh", False):
     import time
     time.sleep(60)
     st.rerun()

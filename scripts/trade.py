@@ -48,7 +48,7 @@ POSITION_EPSILON_PCT = 0.05
 
 MAX_POSITION_PCT = 10.0         # Max 10% of account per position
 MIN_POSITION_USD = 50.0         # Min $50 per position
-MAX_CONCURRENT_POSITIONS = 5    # Max 5 open at once
+MAX_CONCURRENT_POSITIONS = 10   # Max 10 open at once
 MIN_CASH_RESERVE_PCT = 25.0     # Always keep 25% cash
 MIN_STOP_PCT = 3.0              # Stop at least 3% below entry
 MAX_STOP_PCT = 10.0             # Stop at most 10% below entry (caps risk)

@@ -24,7 +24,7 @@ These are enforced in code in `scripts/trade.py` via `validate_order()`. The val
 ### Position Sizing
 1. **Max position size: 10% of account value per trade** (~$100 on $1k account)
 2. **Min position size: $50** — anything smaller is noise
-3. **Max 5 concurrent open positions** at any time
+3. **Max 10 concurrent open positions** at any time
 4. **Cash reserve: minimum 25% of account in cash always** ($250 minimum)
 
 ### Risk Management
