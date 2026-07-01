@@ -11,3 +11,4 @@ build/
 journal/
 data/state.json
 data/outcomes.json
+data/backtest_runs.json

@@ -404,6 +404,19 @@ def _load_intraday(sym):
         return [], {}, f"error: {e}"
 
 
+BACKTEST_FILE = Path(__file__).parent / "data" / "backtest_runs.json"
+
+
+@st.cache_data(ttl=10)
+def load_backtest_runs():
+    if not BACKTEST_FILE.exists():
+        return []
+    try:
+        return json.loads(BACKTEST_FILE.read_text())
+    except Exception:
+        return []
+
+
 def get_stop_target_from_journal(entries: list) -> dict:
     """
     For each symbol, find the most recent BUY with execution_status==SUBMITTED.
@@ -690,7 +703,8 @@ stop_levels = load_active_stop_levels(
 
 st.title("📈 Trading Agent")
 
-tab1, tab2, tab3, tab4 = st.tabs(["🌅 Pre-Market", "🎯 Options", "🔍 Analysis", "📊 Portfolio"])
+tab1, tab2, tab3, tab4, tab5 = st.tabs(
+    ["🌅 Pre-Market", "🎯 Options", "🔍 Analysis", "📊 Portfolio", "🧪 Backtest"])
 
 with tab1:
     # ── Pre-Market Movers ─────────────────────────────────────────────────────
@@ -1764,6 +1778,90 @@ with tab4:
                               font_color="#fafafa", margin=dict(t=20,b=20),
                               legend=dict(orientation="h"))
             st.plotly_chart(fig, use_container_width=True)
+
+with tab5:
+    # ── Backtest ──────────────────────────────────────────────────────────────
+
+    st.subheader("🧪 Backtest")
+    st.caption(
+        "Simulates the agent's BUY setups against historical price data so you can rack up "
+        "practice reps any time — including when the market is closed. **Limitation:** only "
+        "setups A (MA20 pullback) and B (oversold bounce) are tested — these are pure "
+        "price-action rules with no news requirement. Setup C and the SHORT setups D/E need a "
+        "real catalyst headline, and historical news isn't reliably available, so they're left "
+        "out rather than faked."
+    )
+
+    _bt_c1, _bt_c2, _bt_c3, _bt_c4 = st.columns([2, 2, 2, 2])
+    _bt_days = _bt_c1.number_input("Days back", min_value=20, max_value=500, value=180, step=10)
+    _bt_lookahead = _bt_c2.number_input("Lookahead days", min_value=3, max_value=30, value=10)
+    _bt_symbols = _bt_c3.text_input("Symbols (optional)", placeholder="e.g. NVDA,AMD,META")
+    _bt_run = _bt_c4.button("▶ Run Backtest", use_container_width=True, type="primary")
+
+    if _bt_run:
+        _bt_cmd = [PYTHON, str(SCRIPTS_DIR / "backtest.py"),
+                   "--days", str(int(_bt_days)), "--lookahead", str(int(_bt_lookahead))]
+        if _bt_symbols.strip():
+            _bt_cmd += ["--symbols", _bt_symbols.strip()]
+        with st.spinner("Simulating historical trades… (10-60s depending on universe size)"):
+            _bt_res = subprocess.run(_bt_cmd, capture_output=True, text=True, timeout=180)
+        if _bt_res.returncode == 0:
+            st.success("Backtest complete.")
+        else:
+            st.error(f"Backtest failed: {(_bt_res.stderr or _bt_res.stdout)[-800:]}")
+        load_backtest_runs.clear()
+
+    st.divider()
+
+    _bt_runs = load_backtest_runs()
+    if not _bt_runs:
+        st.info("No backtest runs yet. Set your parameters above and click Run Backtest.")
+    else:
+        _bt_latest = _bt_runs[0]
+        _bt_stats = _bt_latest["stats"]
+
+        st.caption(
+            f"Latest run: {_bt_latest['start']} → {_bt_latest['end']}  ·  "
+            f"{_bt_latest['universe_size']} symbols  ·  {_bt_latest['lookahead_days']}d lookahead  ·  "
+            f"run at {_bt_latest['run_at'][:16].replace('T', ' ')}"
+        )
+
+        _s1, _s2, _s3 = st.columns(3)
+        _s4, _s5, _ = st.columns(3)
+        _s1.metric("Simulated Trades", _bt_stats["total"])
+        _s2.metric("Win Rate", f"{_bt_stats['win_rate']}%" if _bt_stats["total"] else "—")
+        _s3.metric("Wins / Losses", f"{_bt_stats['wins']} / {_bt_stats['losses']}")
+        _s4.metric("Avg Return", f"{_bt_stats['avg_return_pct']:+.2f}%" if _bt_stats["total"] else "—")
+        _s5.metric("Total P&L", f"${_bt_stats['total_pnl']:+.2f}" if _bt_stats["total"] else "—")
+
+        if _bt_latest["trades"]:
+            _bt_rows = []
+            _bt_icons = {"win": "✅", "loss": "❌", "breakeven": "➖"}
+            for _t in reversed(_bt_latest["trades"][-50:]):
+                _bt_rows.append({
+                    "": _bt_icons.get(_t["outcome"], ""),
+                    "Date": _t["date"],
+                    "Ticker": _t["ticker"],
+                    "Setup": _t["setup"],
+                    "Entry": f"${_t['entry']:.2f}",
+                    "Stop": f"${_t['stop']:.2f}",
+                    "Target": f"${_t['target']:.2f}",
+                    "Exit": _t["exit_reason"].replace("_", " "),
+                    "Exit Date": _t["exit_date"],
+                    "P&L": f"${_t['pnl']:+.2f}",
+                    "Return": f"{_t['return_pct']:+.1f}%",
+                })
+            st.dataframe(pd.DataFrame(_bt_rows), use_container_width=True, hide_index=True)
+
+        if len(_bt_runs) > 1:
+            with st.expander(f"Previous runs ({len(_bt_runs) - 1})"):
+                for _r in _bt_runs[1:6]:
+                    _rs = _r["stats"]
+                    st.caption(
+                        f"{_r['run_at'][:16].replace('T',' ')} — {_r['start']} to {_r['end']} — "
+                        f"{_rs['total']} trades, {_rs['win_rate']}% win rate, "
+                        f"${_rs['total_pnl']:+.2f} P&L"
+                    )
 
 # ── Auto-refresh ──────────────────────────────────────────────────────────────
 

@@ -1,10 +1,31 @@
 {
-  "week_key": "2026-W20",
-  "week_start_equity": 1000.0,
+  "week_key": "2026-W27",
+  "week_start_equity": 1007.8,
   "active_stops": {
-    "TGT": {"stop_loss": 116.96, "take_profit": 135.43, "entry_limit": 123.12},
-    "UBER": {"stop_loss": 71.47, "take_profit": 82.75, "entry_limit": 75.23},
-    "WMT": {"stop_loss": 125.02, "take_profit": 144.76, "entry_limit": 131.6},
-    "XLE": {"stop_loss": 54.31, "take_profit": 61.45, "entry_limit": 57.07}
+    "JPM": {
+      "stop_loss": 314.95,
+      "take_profit": 364.68,
+      "entry_limit": 331.53
+    },
+    "C": {
+      "stop_loss": 137.88,
+      "take_profit": 159.65,
+      "entry_limit": 145.14
+    },
+    "SBUX": {
+      "stop_loss": 97.9,
+      "take_profit": 113.36,
+      "entry_limit": 103.05
+    },
+    "BAC": {
+      "stop_loss": 54.24,
+      "take_profit": 62.81,
+      "entry_limit": 57.1
+    },
+    "TGT": {
+      "stop_loss": 123.69,
+      "take_profit": 143.22,
+      "entry_limit": 130.2
+    }
   }
 }
