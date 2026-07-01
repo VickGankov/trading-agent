@@ -30,6 +30,12 @@ try:
 except Exception:
     _OUTCOMES_AVAILABLE = False
 
+try:
+    from pwa_patch import ensure_pwa_patch
+    ensure_pwa_patch()
+except Exception:
+    pass  # PWA install prompt just won't be available — app still works fine
+
 JOURNAL_DIR = Path(__file__).parent / "journal"
 SCRIPTS_DIR = Path(__file__).parent / "scripts"
 PYTHON = str(Path(__file__).parent / ".venv" / "bin" / "python")
