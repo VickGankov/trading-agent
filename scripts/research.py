@@ -55,6 +55,7 @@ PAPER = os.getenv("PAPER", "True").lower() == "true"
 _trading_client = None
 _data_client = None
 _news_client = None
+_screener_client = None
 
 
 def _require_alpaca_credentials():
@@ -84,6 +85,30 @@ def get_news_client():
     if _news_client is None:
         _news_client = NewsClient(API_KEY, SECRET_KEY)
     return _news_client
+
+
+def get_screener_client():
+    global _screener_client
+    _require_alpaca_credentials()
+    if _screener_client is None:
+        from alpaca.data.historical.screener import ScreenerClient
+        _screener_client = ScreenerClient(API_KEY, SECRET_KEY)
+    return _screener_client
+
+
+def get_market_movers(top: int = 25):
+    """Real market-wide top gainers/losers (all of Nasdaq/NYSE, not a fixed watchlist)."""
+    from alpaca.data.requests import MarketMoversRequest
+    client = get_screener_client()
+    result = client.get_market_movers(MarketMoversRequest(top=top))
+    return {
+        "gainers": [{"symbol": m.symbol, "price": float(m.price),
+                     "change": float(m.change), "percent_change": float(m.percent_change)}
+                    for m in result.gainers],
+        "losers": [{"symbol": m.symbol, "price": float(m.price),
+                    "change": float(m.change), "percent_change": float(m.percent_change)}
+                   for m in result.losers],
+    }
 
 
 def get_account():

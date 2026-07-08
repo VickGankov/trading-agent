@@ -259,9 +259,14 @@ st.markdown("""
         font-size:0.88em; line-height:1.4;
     }
     .ci-ticker { font-weight:700; color:#e2e8f0; min-width:44px; }
+    .ci-price  { color:#718096; white-space:nowrap; }
     .ci-up     { color:#48bb78; font-weight:600; white-space:nowrap; }
     .ci-dn     { color:#fc8181; font-weight:600; white-space:nowrap; }
     .ci-headline { color:#a0aec0; flex:1; min-width:180px; }
+    .ci-headline a { color:#a0aec0; text-decoration:none; border-bottom:1px dotted #4a5568; }
+    .ci-headline a:hover { color:#e2e8f0; }
+    .ci-time   { color:#4a5568; font-size:0.85em; white-space:nowrap; }
+    .ci-none   { color:#4a5568; font-style:italic; }
 
     /* MACD verdict pill */
     .macd-verdict {
@@ -300,9 +305,53 @@ days_filter  = st.session_state["_days_filter"]
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
 
+def _relative_age(dt) -> str:
+    delta = datetime.now(dt.tzinfo) - dt
+    hrs = delta.total_seconds() / 3600
+    if hrs < 1:
+        return f"{max(1, int(delta.total_seconds() / 60))}m ago"
+    if hrs < 24:
+        return f"{int(hrs)}h ago"
+    return f"{int(hrs / 24)}d ago"
+
+
+def _attach_headline(m: dict):
+    """Alpaca news first, yfinance fallback. Mutates m in place."""
+    import yfinance as yf
+
+    try:
+        import research as _res
+        nd = _res.get_news(m["ticker"], hours=16)
+        items = nd.get("items", [])
+        if items:
+            item = items[0]
+            m["headline"] = item.get("headline", "")
+            m["headline_url"] = item.get("url", "")
+            created = item.get("created_at", "")
+            if created:
+                dt = datetime.fromisoformat(created.replace("Z", "+00:00"))
+                m["headline_age"] = _relative_age(dt)
+            return
+    except Exception:
+        pass
+
+    try:
+        news = yf.Ticker(m["ticker"]).news or []
+        if news:
+            content = news[0].get("content", news[0])
+            m["headline"] = content.get("title", "")
+            m["headline_url"] = (content.get("canonicalUrl") or {}).get("url", "")
+            pub = content.get("pubDate")
+            if pub:
+                dt = datetime.fromisoformat(str(pub).replace("Z", "+00:00"))
+                m["headline_age"] = _relative_age(dt)
+    except Exception:
+        pass
+
+
 @st.cache_data(ttl=300)
 def load_premarket_movers(min_pct: float = 0.8):
-    """Fetch price change vs previous close for watchlist + common large-caps."""
+    """Two sections: your watchlist (always checked) + real market-wide top movers."""
     import yfinance as yf
     from concurrent.futures import ThreadPoolExecutor
 
@@ -313,46 +362,66 @@ def load_premarket_movers(min_pct: float = 0.8):
         wl = {}
 
     priority = [t["symbol"] for t in wl.get("priority_tickers", [])]
-    extra = ["AAPL", "AMZN", "NFLX", "MRVL", "ARM", "QCOM", "CRM", "PANW",
-             "SNOW", "UBER", "SMCI", "ASML", "SHOP", "MSTR", "HOOD"]
-    tickers = list(dict.fromkeys(priority + extra))[:25]
+    filters = wl.get("screener_filters", {})
+    min_price = filters.get("min_price", 5.0)
+    max_price = filters.get("max_price", 500.0)
+    excluded_etfs = set(filters.get("exclude_leveraged_etfs", []))
 
-    def _fetch(tkr):
+    # ── Your Watchlist: always checked regardless of market-wide ranking ──
+    def _fetch_watchlist(tkr):
         try:
             fi = yf.Ticker(tkr).fast_info
-            last = fi.last_price
-            prev = fi.previous_close
+            last, prev = fi.last_price, fi.previous_close
             if not last or not prev or prev == 0:
                 return None
             chg = round((last - prev) / prev * 100, 2)
-            if abs(chg) < min_pct:
-                return None
-            return {"ticker": tkr, "price": round(last, 2),
-                    "prev_close": round(prev, 2), "change_pct": chg, "headline": ""}
+            return {"ticker": tkr, "price": round(last, 2), "prev_close": round(prev, 2),
+                    "change_pct": chg, "headline": "", "headline_url": "", "headline_age": ""}
         except Exception:
             return None
 
     with ThreadPoolExecutor(max_workers=12) as ex:
-        raw = list(ex.map(_fetch, tickers))
+        raw_wl = list(ex.map(_fetch_watchlist, priority))
+    watchlist_movers = sorted(
+        [r for r in raw_wl if r and abs(r["change_pct"]) >= min_pct],
+        key=lambda x: abs(x["change_pct"]), reverse=True)
 
-    movers = sorted([r for r in raw if r],
-                    key=lambda x: abs(x["change_pct"]), reverse=True)[:12]
-
-    # News for top movers via Alpaca
+    # ── Market-Wide: real top gainers/losers, filtered for quality ──
+    market_movers = []
     try:
         import research as _res
-        for m in movers[:8]:
-            try:
-                nd = _res.get_news(m["ticker"], hours=16)
-                items = nd.get("items", [])
-                if items:
-                    m["headline"] = items[0].get("headline", "")
-            except Exception:
-                pass
+        wl_set = set(priority)
+
+        def _is_warrant_like(sym: str) -> bool:
+            return "." in sym or sym.endswith(("W", "WS", "WW"))
+
+        def _valid(m):
+            return (m["symbol"] not in wl_set
+                    and m["symbol"] not in excluded_etfs
+                    and not _is_warrant_like(m["symbol"])
+                    and min_price <= m["price"] <= max_price)
+
+        raw_mkt = _res.get_market_movers(top=50)  # API max — most raw movers are sub-$5 penny stocks
+        gainers = [m for m in raw_mkt["gainers"] if _valid(m)][:10]
+        losers = [m for m in raw_mkt["losers"] if _valid(m)][:10]
+
+        for m in gainers + losers:
+            market_movers.append({
+                "ticker": m["symbol"], "price": round(m["price"], 2),
+                "prev_close": round(m["price"] - m["change"], 2),
+                "change_pct": round(m["percent_change"], 2),
+                "headline": "", "headline_url": "", "headline_age": "",
+            })
     except Exception:
         pass
 
-    return movers
+    # ── Headlines for both sections in parallel ──
+    all_items = watchlist_movers + market_movers
+    if all_items:
+        with ThreadPoolExecutor(max_workers=12) as ex:
+            list(ex.map(_attach_headline, all_items))
+
+    return {"watchlist": watchlist_movers, "market": market_movers}
 
 
 @st.cache_data(ttl=60)
@@ -722,54 +791,48 @@ with tab1:
         st.rerun()
 
     _pm_data = load_premarket_movers()
+    _watchlist_movers = _pm_data.get("watchlist", [])
+    _market_movers = _pm_data.get("market", [])
 
-    if _pm_data:
-        _colors = ["#48bb78" if m["change_pct"] > 0 else "#fc8181" for m in _pm_data]
-        _fig_pm  = go.Figure(go.Bar(
-            y=[m["ticker"] for m in _pm_data],
-            x=[m["change_pct"] for m in _pm_data],
-            orientation="h",
-            marker_color=_colors,
-            text=[f"{m['change_pct']:+.1f}%" for m in _pm_data],
-            textposition="outside",
-            customdata=[[m["price"], m["prev_close"]] for m in _pm_data],
-            hovertemplate="<b>%{y}</b><br>Price: $%{customdata[0]}<br>"
-                          "Prev close: $%{customdata[1]}<br>Change: %{x:+.2f}%<extra></extra>",
-        ))
-        _fig_pm.update_layout(
-            height=max(220, len(_pm_data) * 34),
-            margin=dict(l=0, r=70, t=4, b=4),
-            xaxis=dict(title="% vs prev close", zeroline=True,
-                       zerolinecolor="#4a5568", zerolinewidth=1, ticksuffix="%"),
-            yaxis=dict(autorange="reversed"),
-            paper_bgcolor="rgba(0,0,0,0)",
-            plot_bgcolor="rgba(0,0,0,0)",
-            font=dict(color="#e2e8f0", size=12),
-            showlegend=False,
-        )
-        st.plotly_chart(_fig_pm, width='stretch',
-                        config={"staticPlot": True})
+    def _render_mover_list(movers: list, empty_msg: str):
+        if not movers:
+            st.caption(empty_msg)
+            return
+        for m in movers:
+            _clr_cls = "ci-up" if m["change_pct"] > 0 else "ci-dn"
+            _sign = "+" if m["change_pct"] > 0 else ""
+            if m.get("headline"):
+                _headline_html = (f'<a href="{m["headline_url"]}" target="_blank">{m["headline"]}</a>'
+                                   if m.get("headline_url") else m["headline"])
+                _age_html = f'<span class="ci-time">{m["headline_age"]}</span>' if m.get("headline_age") else ""
+            else:
+                _headline_html = '<span class="ci-none">no recent headline</span>'
+                _age_html = ""
+            st.markdown(
+                f'<div class="catalyst-item">'
+                f'<span class="ci-ticker">{m["ticker"]}</span>'
+                f'<span class="ci-price">${m["price"]:.2f}</span>'
+                f'<span class="{_clr_cls}">{_sign}{m["change_pct"]:.1f}%</span>'
+                f'<span class="ci-headline">{_headline_html}</span>'
+                f'{_age_html}'
+                f'</div>',
+                unsafe_allow_html=True,
+            )
 
-        # Catalyst headlines
-        _headlined = [m for m in _pm_data if m.get("headline")]
-        if _headlined:
-            st.caption("**Catalysts**")
-            for m in _headlined:
-                _clr = "green" if m["change_pct"] > 0 else "red"
-                _tc, _pc, _hc = st.columns([1, 1, 9])
-                _tc.markdown(f"**{m['ticker']}**")
-                _pc.markdown(f":{_clr}[{m['change_pct']:+.1f}%]")
-                _hc.caption(m["headline"])
-        else:
-            st.caption("No news catalysts found via Alpaca for current movers.")
-    else:
-        st.caption("No significant movers (>0.8%) right now — check back closer to market open.")
+    st.caption("**Your Watchlist**")
+    _render_mover_list(_watchlist_movers,
+                       "No watchlist tickers moved >0.8% yet — check back closer to market open.")
+
+    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
+    st.caption("**Market-Wide Movers** — top gainers/losers across the whole market")
+    _render_mover_list(_market_movers, "No market-wide movers available right now.")
 
     # ── 5-min Chart + MACD ───────────────────────────────────────────────────
-    if _pm_data:
+    _all_movers = _watchlist_movers + _market_movers
+    if _all_movers:
         from plotly.subplots import make_subplots
 
-        _ticker_options = [m["ticker"] for m in _pm_data]
+        _ticker_options = [m["ticker"] for m in _all_movers]
         _selected = st.selectbox("📈 5-min chart + MACD", _ticker_options,
                                  key="intraday_select")
 
