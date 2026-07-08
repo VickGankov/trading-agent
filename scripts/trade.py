@@ -151,7 +151,7 @@ def get_account_state():
         "cash": float(acct.cash),
         "last_equity": float(acct.last_equity),
         "buying_power": float(acct.buying_power),
-        "daytrade_count": int(acct.daytrade_count),
+        "daytrade_count": int(acct.daytrade_count) if acct.daytrade_count is not None else 0,
         "pattern_day_trader": acct.pattern_day_trader,
         "trading_blocked": acct.trading_blocked,
         "positions": [{"symbol": p.symbol, "qty": float(p.qty), "side": p.side.value} for p in positions],

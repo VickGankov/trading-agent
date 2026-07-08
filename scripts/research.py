@@ -109,7 +109,7 @@ def get_account():
         "account_value": float(acct.equity),
         "cash": float(acct.cash),
         "buying_power": float(acct.buying_power),
-        "daytrade_count": int(acct.daytrade_count),
+        "daytrade_count": int(acct.daytrade_count) if acct.daytrade_count is not None else 0,
         "pattern_day_trader": acct.pattern_day_trader,
         "trading_blocked": acct.trading_blocked,
         "account_blocked": acct.account_blocked,
@@ -639,10 +639,11 @@ def daytrade_count():
     """PDT compliance check."""
     trading = get_trading_client()
     acct = trading.get_account()
+    dt_count = int(acct.daytrade_count) if acct.daytrade_count is not None else 0
     return {
-        "daytrade_count_5days": int(acct.daytrade_count),
+        "daytrade_count_5days": dt_count,
         "pdt_status": acct.pattern_day_trader,
-        "remaining_daytrades": max(0, 3 - int(acct.daytrade_count)),
+        "remaining_daytrades": max(0, 3 - dt_count),
         "warning": "PDT enforced if account < $25k and 4+ day trades in 5 days"
     }
 
