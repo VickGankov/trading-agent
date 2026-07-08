@@ -717,7 +717,7 @@ with tab1:
 
     _pm_hdr, _pm_btn = st.columns([6, 1])
     _pm_hdr.subheader("🌅 Pre-Market Movers")
-    if _pm_btn.button("🔄 Refresh", key="pm_refresh", use_container_width=True):
+    if _pm_btn.button("🔄 Refresh", key="pm_refresh", width='stretch'):
         load_premarket_movers.clear()
         st.rerun()
 
@@ -747,7 +747,7 @@ with tab1:
             font=dict(color="#e2e8f0", size=12),
             showlegend=False,
         )
-        st.plotly_chart(_fig_pm, use_container_width=True,
+        st.plotly_chart(_fig_pm, width='stretch',
                         config={"staticPlot": True})
 
         # Catalyst headlines
@@ -823,7 +823,7 @@ with tab1:
             )
             _fig_intra.update_xaxes(gridcolor="#2d3748", showgrid=True)
             _fig_intra.update_yaxes(gridcolor="#2d3748", showgrid=True)
-            st.plotly_chart(_fig_intra, use_container_width=True,
+            st.plotly_chart(_fig_intra, width='stretch',
                             config={"staticPlot": True})
 
             if _has_macd:
@@ -858,8 +858,8 @@ with tab2:
         st.session_state.daily_play_loading = False
 
     scan_col, clear_col = st.columns([3, 1])
-    run_scan = scan_col.button("🔍 Scan for Today's Play", use_container_width=True, type="primary")
-    if clear_col.button("Clear", use_container_width=True):
+    run_scan = scan_col.button("🔍 Scan for Today's Play", width='stretch', type="primary")
+    if clear_col.button("Clear", width='stretch'):
         st.session_state.daily_play = None
         st.rerun()
 
@@ -1056,7 +1056,7 @@ with tab2:
                                 "Vol Ratio": f"{s.get('vol_ratio','—')}x",
                             })
                     if rows:
-                        st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                        st.dataframe(pd.DataFrame(rows), width='stretch', hide_index=True)
 
             # Supporting news
             news_hl = dp.get("news_headlines", [])
@@ -1077,7 +1077,7 @@ with tab2:
     else:
         _oc_hdr, _oc_btn = st.columns([5, 1])
         _oc_hdr.caption("Track whether AI options picks played out.")
-        if _oc_btn.button("🔄 Check Expired", use_container_width=True, key="check_exp_tab2"):
+        if _oc_btn.button("🔄 Check Expired", width='stretch', key="check_exp_tab2"):
             _updated = _outcomes_mod.update_expired_trades()
             if _updated:
                 st.success(f"Updated {len(_updated)} expired trade(s).")
@@ -1109,7 +1109,7 @@ with tab2:
                     "P&L":      f"${_pnl:+.0f}" if _pnl is not None else "—",
                     "Return":   f"{_ret:+.1f}%" if _ret is not None else "—",
                 })
-            st.dataframe(pd.DataFrame(_rows_ot), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(_rows_ot), width='stretch', hide_index=True)
         elif _perf["open"] == 0:
             st.info("No options trades recorded yet. Run Today's Options Play to start tracking.")
 
@@ -1122,7 +1122,7 @@ with tab3:
         "ticker", placeholder="e.g. AAPL  ·  NVDA  ·  MSFT  ·  SPY",
         label_visibility="collapsed"
     ).strip().upper()
-    analyze_clicked = col_btn.button("Analyze ▶", use_container_width=True, type="primary")
+    analyze_clicked = col_btn.button("Analyze ▶", width='stretch', type="primary")
 
     if "analysis_result" not in st.session_state:
         st.session_state.analysis_result = None
@@ -1540,15 +1540,15 @@ with tab4:
     # ── Inline agent controls ────────────────────────────────────────────────────
 
     _ca, _cb, _cc, _cd, _ce = st.columns([2, 2, 3, 1, 1])
-    _run_live = _ca.button("▶ Run Live",  use_container_width=True, type="primary")
-    _run_dry  = _cb.button("◎ Dry Run",   use_container_width=True)
+    _run_live = _ca.button("▶ Run Live",  width='stretch', type="primary")
+    _run_dry  = _cb.button("◎ Dry Run",   width='stretch')
     _cc.toggle("Auto-refresh (60s)", key="_auto_refresh")
     _days_filter_val = _cd.number_input("Days", 1, 30,
                                         st.session_state.get("_days_filter", 7),
                                         key="_days_filter", label_visibility="visible",
                                         help="Journal lookback days")
     days_filter = int(_days_filter_val)
-    if _ce.button("🔄", use_container_width=True, help="Refresh all data"):
+    if _ce.button("🔄", width='stretch', help="Refresh all data"):
         st.cache_data.clear()
         st.rerun()
 
@@ -1692,8 +1692,8 @@ with tab4:
             return ""
 
         st.dataframe(
-            display_df.style.applymap(color_pl, subset=["P&L", "P&L %", "→ Stop", "→ Target"]),
-            use_container_width=True,
+            display_df.style.map(color_pl, subset=["P&L", "P&L %", "→ Stop", "→ Target"]),
+            width='stretch',
             hide_index=True
         )
 
@@ -1708,7 +1708,7 @@ with tab4:
             fig.update_layout(title="Unrealized P&L by Position", yaxis_title="USD",
                               height=260, plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
                               font_color="#fafafa", margin=dict(t=40,b=20))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
     else:
         st.info("No open positions.")
 
@@ -1716,7 +1716,7 @@ with tab4:
 
     if open_orders:
         st.subheader("Open Orders (Alpaca)")
-        st.dataframe(pd.DataFrame(open_orders), use_container_width=True, hide_index=True)
+        st.dataframe(pd.DataFrame(open_orders), width='stretch', hide_index=True)
 
     st.divider()
 
@@ -1740,7 +1740,7 @@ with tab4:
             font_color="#fafafa", margin=dict(t=20,b=20),
             legend=dict(orientation="h")
         )
-        st.plotly_chart(fig, use_container_width=True)
+        st.plotly_chart(fig, width='stretch')
         st.divider()
 
     # ── Cycle Stats ───────────────────────────────────────────────────────────────
@@ -1783,7 +1783,7 @@ with tab4:
             fig.update_layout(height=260, paper_bgcolor="#0e1117",
                               font_color="#fafafa", margin=dict(t=20,b=20),
                               legend=dict(orientation="h"))
-            st.plotly_chart(fig, use_container_width=True)
+            st.plotly_chart(fig, width='stretch')
 
 with tab5:
     # ── Backtest ──────────────────────────────────────────────────────────────
@@ -1802,7 +1802,7 @@ with tab5:
     _bt_days = _bt_c1.number_input("Days back", min_value=20, max_value=500, value=180, step=10)
     _bt_lookahead = _bt_c2.number_input("Lookahead days", min_value=3, max_value=30, value=10)
     _bt_symbols = _bt_c3.text_input("Symbols (optional)", placeholder="e.g. NVDA,AMD,META")
-    _bt_run = _bt_c4.button("▶ Run Backtest", use_container_width=True, type="primary")
+    _bt_run = _bt_c4.button("▶ Run Backtest", width='stretch', type="primary")
 
     if _bt_run:
         _bt_cmd = [PYTHON, str(SCRIPTS_DIR / "backtest.py"),
@@ -1857,7 +1857,7 @@ with tab5:
                     "P&L": f"${_t['pnl']:+.2f}",
                     "Return": f"{_t['return_pct']:+.1f}%",
                 })
-            st.dataframe(pd.DataFrame(_bt_rows), use_container_width=True, hide_index=True)
+            st.dataframe(pd.DataFrame(_bt_rows), width='stretch', hide_index=True)
 
         if len(_bt_runs) > 1:
             with st.expander(f"Previous runs ({len(_bt_runs) - 1})"):
