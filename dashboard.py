@@ -251,22 +251,54 @@ st.markdown("""
     section[data-testid="stSidebar"],
     [data-testid="collapsedControl"] { display:none !important; }
 
-    /* Catalyst headline flex rows */
-    .catalyst-item {
-        display:flex; flex-wrap:wrap; align-items:baseline;
-        gap:6px 10px; padding:7px 0;
-        border-bottom:1px solid #1e2535;
-        font-size:0.88em; line-height:1.4;
+    /* Mover section header */
+    .mover-section-hdr {
+        display:flex; align-items:center; gap:8px;
+        margin:4px 0 10px;
     }
-    .ci-ticker { font-weight:700; color:#e2e8f0; min-width:44px; }
-    .ci-price  { color:#718096; white-space:nowrap; }
-    .ci-up     { color:#48bb78; font-weight:600; white-space:nowrap; }
-    .ci-dn     { color:#fc8181; font-weight:600; white-space:nowrap; }
-    .ci-headline { color:#a0aec0; flex:1; min-width:180px; }
-    .ci-headline a { color:#a0aec0; text-decoration:none; border-bottom:1px dotted #4a5568; }
-    .ci-headline a:hover { color:#e2e8f0; }
-    .ci-time   { color:#4a5568; font-size:0.85em; white-space:nowrap; }
-    .ci-none   { color:#4a5568; font-style:italic; }
+    .mover-section-title { font-size:0.95em; font-weight:700; color:#e2e8f0; }
+    .mover-section-count {
+        font-size:0.72em; color:#718096; background:#1e2130;
+        padding:2px 9px; border-radius:10px;
+    }
+
+    /* Mover cards */
+    .mover-card {
+        display:flex; align-items:center; gap:12px;
+        background:#161b2e; border:1px solid #2d3250; border-left:3px solid #4a5568;
+        border-radius:10px; padding:10px 14px; margin-bottom:8px;
+    }
+    .mover-card.up   { border-left-color:#00d4aa; }
+    .mover-card.down { border-left-color:#ff4b4b; }
+    .mover-rank {
+        width:22px; height:22px; border-radius:50%;
+        background:#1e2130; color:#718096;
+        font-size:0.68em; font-weight:700;
+        display:flex; align-items:center; justify-content:center; flex-shrink:0;
+    }
+    .mover-main { flex:0 0 auto; min-width:120px; }
+    .mover-ticker-line { display:flex; align-items:baseline; gap:8px; }
+    .mover-ticker { font-weight:700; font-size:1.05em; color:#e2e8f0; }
+    .mover-change { display:inline-flex; align-items:center; gap:3px; font-weight:700; font-size:0.9em; }
+    .mover-change.up   { color:#00d4aa; }
+    .mover-change.down { color:#ff4b4b; }
+    .mover-change svg  { width:10px; height:10px; }
+    .mover-price { color:#718096; font-size:0.8em; margin-top:1px; }
+    .mover-catalyst {
+        flex:1; min-width:0;
+        display:flex; align-items:center; gap:6px;
+        font-size:0.85em; color:#a0aec0;
+        border-left:1px solid #2d3250; padding-left:12px;
+    }
+    .mover-catalyst a { color:#a0aec0; text-decoration:none; }
+    .mover-catalyst a:hover { color:#e2e8f0; text-decoration:underline; }
+    .mover-catalyst-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
+    .mover-catalyst-text.mover-none { color:#4a5568; font-style:italic; }
+    .mover-flash { color:#f6ad55; flex-shrink:0; }
+    .mover-flash svg { width:12px; height:12px; }
+    .mover-time { color:#4a5568; font-size:0.82em; white-space:nowrap; flex-shrink:0;
+                  display:inline-flex; align-items:center; gap:3px; }
+    .mover-time svg { width:10px; height:10px; }
 
     /* MACD verdict pill */
     .macd-verdict {
@@ -289,7 +321,13 @@ st.markdown("""
         [data-testid="stMetricValue"] { font-size:1.1em !important; }
         [data-testid="stMetricLabel"] { font-size:0.62em !important; }
         [data-testid="stDataFrame"]   { overflow-x:auto !important; }
-        .ci-headline { min-width:100% !important; }
+        .mover-card { flex-wrap:wrap; }
+        .mover-catalyst {
+            border-left:none !important; padding-left:0 !important;
+            margin-top:6px; width:100%; padding-top:6px;
+            border-top:1px solid #1e2535;
+        }
+        .mover-catalyst-text { white-space:normal !important; }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -304,6 +342,22 @@ auto_refresh = st.session_state["_auto_refresh"]
 days_filter  = st.session_state["_days_filter"]
 
 # ── Data loaders ──────────────────────────────────────────────────────────────
+
+# Self-contained inline icons (no external font/CDN — this app has hit enough
+# network filtering issues on real user networks that a webfont dependency
+# for pure decoration isn't worth the risk).
+_ICON_UP = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" '
+            'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+            '<polyline points="3,17 9,11 13,15 21,7"/><polyline points="14,7 21,7 21,14"/></svg>')
+_ICON_DOWN = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.5" '
+              'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+              '<polyline points="3,7 9,13 13,9 21,17"/><polyline points="21,10 21,17 14,17"/></svg>')
+_ICON_CLOCK = ('<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" '
+               'stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+               '<circle cx="12" cy="12" r="9"/><polyline points="12,7 12,12 16,14"/></svg>')
+_ICON_FLASH = ('<svg viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">'
+               '<path d="M13 2L3 14h7l-1 8 11-14h-7l1-6z"/></svg>')
+
 
 def _relative_age(dt) -> str:
     delta = datetime.now(dt.tzinfo) - dt
@@ -794,37 +848,80 @@ with tab1:
     _watchlist_movers = _pm_data.get("watchlist", [])
     _market_movers = _pm_data.get("market", [])
 
-    def _render_mover_list(movers: list, empty_msg: str):
+    def _mover_card_html(m: dict, rank: int) -> str:
+        is_up = m["change_pct"] > 0
+        direction = "up" if is_up else "down"
+        icon = _ICON_UP if is_up else _ICON_DOWN
+        sign = "+" if is_up else ""
+
+        if m.get("headline"):
+            headline_inner = (f'<a href="{m["headline_url"]}" target="_blank">{m["headline"]}</a>'
+                              if m.get("headline_url") else m["headline"])
+            catalyst_html = (f'<span class="mover-flash">{_ICON_FLASH}</span>'
+                             f'<span class="mover-catalyst-text">{headline_inner}</span>')
+            if m.get("headline_age"):
+                catalyst_html += f'<span class="mover-time">{_ICON_CLOCK}{m["headline_age"]}</span>'
+        else:
+            catalyst_html = '<span class="mover-catalyst-text mover-none">No recent headline</span>'
+
+        return (
+            f'<div class="mover-card {direction}">'
+            f'<div class="mover-rank">{rank}</div>'
+            f'<div class="mover-main">'
+            f'<div class="mover-ticker-line">'
+            f'<span class="mover-ticker">{m["ticker"]}</span>'
+            f'<span class="mover-change {direction}">{icon}{sign}{m["change_pct"]:.1f}%</span>'
+            f'</div>'
+            f'<div class="mover-price">${m["price"]:.2f}</div>'
+            f'</div>'
+            f'<div class="mover-catalyst">{catalyst_html}</div>'
+            f'</div>'
+        )
+
+    def _render_mover_list(movers: list, empty_msg: str, limit: int = 5):
         if not movers:
             st.caption(empty_msg)
             return
-        for m in movers:
-            _clr_cls = "ci-up" if m["change_pct"] > 0 else "ci-dn"
-            _sign = "+" if m["change_pct"] > 0 else ""
-            if m.get("headline"):
-                _headline_html = (f'<a href="{m["headline_url"]}" target="_blank">{m["headline"]}</a>'
-                                   if m.get("headline_url") else m["headline"])
-                _age_html = f'<span class="ci-time">{m["headline_age"]}</span>' if m.get("headline_age") else ""
-            else:
-                _headline_html = '<span class="ci-none">no recent headline</span>'
-                _age_html = ""
-            st.markdown(
-                f'<div class="catalyst-item">'
-                f'<span class="ci-ticker">{m["ticker"]}</span>'
-                f'<span class="ci-price">${m["price"]:.2f}</span>'
-                f'<span class="{_clr_cls}">{_sign}{m["change_pct"]:.1f}%</span>'
-                f'<span class="ci-headline">{_headline_html}</span>'
-                f'{_age_html}'
-                f'</div>',
-                unsafe_allow_html=True,
-            )
 
-    st.caption("**Your Watchlist**")
+        # Rank by magnitude, with a bonus for genuine catalyst-backed moves so a
+        # smaller but news-driven move can outrank a bigger move with no story behind it.
+        CATALYST_BONUS = 3.0
+        ranked = sorted(
+            movers,
+            key=lambda m: abs(m["change_pct"]) + (CATALYST_BONUS if m.get("headline") else 0),
+            reverse=True,
+        )
+        top, rest = ranked[:limit], ranked[limit:]
+
+        st.markdown("".join(_mover_card_html(m, i + 1) for i, m in enumerate(top)),
+                    unsafe_allow_html=True)
+
+        if rest:
+            with st.expander(f"Show {len(rest)} more"):
+                st.markdown(
+                    "".join(_mover_card_html(m, i + limit + 1) for i, m in enumerate(rest)),
+                    unsafe_allow_html=True,
+                )
+
+    st.markdown(
+        '<div class="mover-section-hdr">'
+        '<span class="mover-section-title">Your Watchlist</span>'
+        f'<span class="mover-section-count">{len(_watchlist_movers)} tracked</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
     _render_mover_list(_watchlist_movers,
                        "No watchlist tickers moved >0.8% yet — check back closer to market open.")
 
-    st.markdown("<div style='height:10px'></div>", unsafe_allow_html=True)
-    st.caption("**Market-Wide Movers** — top gainers/losers across the whole market")
+    st.markdown("<div style='height:14px'></div>", unsafe_allow_html=True)
+
+    st.markdown(
+        '<div class="mover-section-hdr">'
+        '<span class="mover-section-title">Market-Wide Movers</span>'
+        f'<span class="mover-section-count">{len(_market_movers)} found</span>'
+        '</div>',
+        unsafe_allow_html=True,
+    )
     _render_mover_list(_market_movers, "No market-wide movers available right now.")
 
     # ── 5-min Chart + MACD ───────────────────────────────────────────────────
