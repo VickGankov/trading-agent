@@ -75,6 +75,20 @@ LEVERAGED_ETFS = {
     "UVXY", "SVXY", "VXX", "TVIX"
 }
 
+
+def effective_equity_usd(equity: float) -> float:
+    """Bankroll used for all sizing: real equity, capped at ACCOUNT_CAP_USD."""
+    if ACCOUNT_CAP_USD:
+        return min(float(equity), float(ACCOUNT_CAP_USD))
+    return float(equity)
+
+
+def max_position_usd(equity: float) -> float:
+    """Single source of truth for max position notional — derives from live equity,
+    so sizing is correct at today's $1k paper balance and scales automatically if
+    the account is reset larger (capped at ACCOUNT_CAP_USD)."""
+    return effective_equity_usd(equity) * (MAX_POSITION_PCT / 100.0)
+
 _trading_client = None
 
 
@@ -185,11 +199,8 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
     state = get_account_state()
 
     # Apply optional account-size cap to guard against oversized paper accounts.
-    effective_equity = state["equity"]
-    effective_cash = state["cash"]
-    if ACCOUNT_CAP_USD:
-        effective_equity = min(float(state["equity"]), float(ACCOUNT_CAP_USD))
-        effective_cash = min(float(state["cash"]), float(effective_equity))
+    effective_equity = effective_equity_usd(state["equity"])
+    effective_cash = min(float(state["cash"]), effective_equity)
 
     if state["trading_blocked"]:
         return False, "Account trading is BLOCKED"
@@ -283,10 +294,12 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
         if limit_price < MIN_PRICE or limit_price > MAX_PRICE:
             return False, f"Price {limit_price} outside allowed range ${MIN_PRICE}-${MAX_PRICE}"
 
-        # Stop placement — above entry for shorts (same % rules as longs)
+        # Stop placement — above entry for shorts (same % rules as longs,
+        # same day-trade inference from stop width as the buy branch)
         stop_pct = ((stop_price - limit_price) / limit_price) * 100
-        min_stop = 0.5 if is_day_trade else MIN_STOP_PCT
-        max_stop = 2.0 if is_day_trade else MAX_STOP_PCT
+        effective_is_day_trade = is_day_trade or (0.5 <= stop_pct <= 2.0)
+        min_stop = 0.5 if effective_is_day_trade else MIN_STOP_PCT
+        max_stop = 2.0 if effective_is_day_trade else MAX_STOP_PCT
         if stop_pct < min_stop:
             return False, f"Stop too tight: {stop_pct:.2f}% above entry (min {min_stop}%)"
         if stop_pct > max_stop:
@@ -298,9 +311,9 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
         if reward / risk < MIN_RR_RATIO:
             return False, f"R:R too low: {reward/risk:.2f} (min {MIN_RR_RATIO})"
 
-        # Position size
+        # Position size — same capped bankroll as the buy branch
         order_value = qty * limit_price
-        position_pct = (order_value / state["equity"]) * 100
+        position_pct = (order_value / effective_equity) * 100
         if order_value < MIN_POSITION_USD:
             return False, f"Position too small: ${order_value:.2f} (min ${MIN_POSITION_USD})"
         if position_pct > MAX_POSITION_PCT + POSITION_EPSILON_PCT:

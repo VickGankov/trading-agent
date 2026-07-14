@@ -73,11 +73,13 @@ CLAUDE_MD = Path(__file__).parent.parent / "CLAUDE.md"
 WATCHLIST_PATH = Path(__file__).parent.parent / "data" / "watchlist.json"
 
 # Condensed system prompt for Groq (stays under 12K TPM free tier limit)
-GROQ_SYSTEM = """Disciplined paper trading agent. $1000 paper account.
-Rules: max $100/position (10%), min $50 order, max 5 open, keep $250+ cash. No options, no crypto, no leveraged ETFs.
+GROQ_SYSTEM = """Disciplined paper trading agent.
+Account size, position limits, and cash reserve are enforced in code — the prompt
+gives you pre-computed entry/stop/target/qty per candidate. Copy them exactly.
+No options, no crypto, no leveraged ETFs.
 
 BUY entry_limit = current_price + 0.3% (round to 2 decimals). SHORT entry_limit = current_price - 0.3%.
-Fractional qty: floor(100 / entry_limit * 100) / 100. Verify qty × entry_limit ≥ $50.
+qty is pre-computed per candidate — never recalculate it yourself.
 
 OUTPUT BUY when one setup applies and no rejection fires:
   A. MA20 PULLBACK — price within 4% above MA20, RSI 38-60, above MA50.
@@ -608,7 +610,8 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
             stop   = round(entry * 0.950, 2)          # 5% stop
         if "target" not in locals():
             target = round(entry * 1.100, 2)         # 10% target
-        qty    = _math.floor((100.0 / entry) * 100) / 100  # max $100 position, floored
+        _max_pos = trade_module.max_position_usd(acct["account_value"])
+        qty    = _math.floor((_max_pos / entry) * 100) / 100  # cap-aware position, floored
 
         action_hint = "→ BUY" if (setup not in ("NO_SETUP",) and not setup.startswith("REJECT") and not earn_flag) else "→ NO TRADE"
 
@@ -627,7 +630,7 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
     candidates_block = "\n".join(candidate_rows)
 
     prompt = f"""Date: {datetime.now().strftime('%Y-%m-%d %H:%M ET')} {mode_note}
-Account: ${acct['account_value']:.0f} total, ${acct['cash']:.0f} cash, {acct['positions_count']}/5 positions, {data['pdt']['daytrade_count_5days']}/3 day trades
+Account: ${acct['account_value']:.0f} total, ${acct['cash']:.0f} cash, {acct['positions_count']}/{trade_module.MAX_CONCURRENT_POSITIONS} positions
 Market: open={data['clock']['is_open']} | SPY 5d:{spy.get('5d_change_pct',0):+.1f}% RSI:{spy.get('rsi14','?')} | QQQ 5d:{qqq.get('5d_change_pct',0):+.1f}% RSI:{qqq.get('rsi14','?')}
 
 SCREENER (top 20): {screener_summary}
@@ -654,7 +657,7 @@ Output one JSON per candidate, then one-sentence reflection."""
     # Execute orders and capture results for journal annotation
     execution_results = {}
     if dry_run:
-        execution_results = _validate_from_text(response_text)
+        execution_results = _validate_from_text(response_text, account=acct)
     elif not premarket:
         execution_results = _execute_from_text(response_text, data["account"])
 
@@ -722,16 +725,17 @@ def _execute_from_text(text: str, account: dict) -> dict:
     """Parse and execute BUY/SELL decisions. Returns {ticker: result} for journal annotation."""
     import math
     results = {}
+    _max_pos = trade_module.max_position_usd(account.get("account_value", 0) or 0)
     for decision in _parse_decisions_from_text(text):
         action = decision.get("action", "")
         ticker = decision.get("ticker", "")
         if action == "BUY" and ticker:
             raw_qty = float(decision.get("qty", 0))
             entry = float(decision.get("entry_limit", decision.get("entry", 0)) or 0)
-            # Floor, then hard-cap at floor(100/entry*100)/100 — LLMs sometimes round up
+            # Floor, then hard-cap at the cap-aware max position — LLMs sometimes round up
             qty = math.floor(raw_qty * 100) / 100
             if entry > 0:
-                qty = min(qty, math.floor((100.0 / entry) * 100) / 100)
+                qty = min(qty, math.floor((_max_pos / entry) * 100) / 100)
             stop  = float(decision.get("stop_loss",  decision.get("stop",   0)))
             tgt   = float(decision.get("take_profit", decision.get("target", 0)))
             entry = float(decision.get("entry_limit", decision.get("entry",  0)))
@@ -743,12 +747,11 @@ def _execute_from_text(text: str, account: dict) -> dict:
             if result.get("status") == "SUBMITTED" and stop and tgt:
                 trade_module.save_stop_level(ticker, stop, tgt, entry)
         elif action == "SHORT" and ticker:
-            import math
             raw_qty = float(decision.get("qty", 0))
             entry = float(decision.get("entry_limit", decision.get("entry", 0)) or 0)
             qty = math.floor(raw_qty * 100) / 100
             if entry > 0:
-                qty = min(qty, math.floor((100.0 / entry) * 100) / 100)
+                qty = min(qty, math.floor((_max_pos / entry) * 100) / 100)
             stop = float(decision.get("stop_loss", decision.get("stop", 0)))
             tgt  = float(decision.get("take_profit", decision.get("target", 0)))
             entry = float(decision.get("entry_limit", decision.get("entry", 0)))
@@ -781,10 +784,12 @@ def _execute_from_text(text: str, account: dict) -> dict:
     return results
 
 
-def _validate_from_text(text: str) -> dict:
+def _validate_from_text(text: str, account: dict | None = None) -> dict:
     """Validate parsed BUY/SELL decisions without submitting orders."""
     import math
     results = {}
+    _acct_val = (account or {}).get("account_value", 0) or trade_module.ACCOUNT_CAP_USD
+    _max_pos = trade_module.max_position_usd(_acct_val)
     for decision in _parse_decisions_from_text(text):
         action = decision.get("action", "")
         ticker = decision.get("ticker", "")
@@ -793,7 +798,7 @@ def _validate_from_text(text: str) -> dict:
             entry = float(decision.get("entry_limit", decision.get("entry", 0)) or 0)
             qty = math.floor(raw_qty * 100) / 100
             if entry > 0:
-                qty = min(qty, math.floor((100.0 / entry) * 100) / 100)
+                qty = min(qty, math.floor((_max_pos / entry) * 100) / 100)
             stop = float(decision.get("stop_loss", decision.get("stop", 0)))
             tgt = float(decision.get("take_profit", decision.get("target", 0)))
             valid, msg = trade_module.validate_order(ticker, "buy", qty, entry, stop, tgt)
@@ -811,7 +816,7 @@ def _validate_from_text(text: str) -> dict:
             entry = float(decision.get("entry_limit", decision.get("entry", 0)) or 0)
             qty = math.floor(raw_qty * 100) / 100
             if entry > 0:
-                qty = min(qty, math.floor((100.0 / entry) * 100) / 100)
+                qty = min(qty, math.floor((_max_pos / entry) * 100) / 100)
             stop = float(decision.get("stop_loss", decision.get("stop", 0)))
             tgt = float(decision.get("take_profit", decision.get("target", 0)))
             valid, msg = trade_module.validate_order(ticker, "short", qty, entry, stop, tgt)
@@ -1966,7 +1971,9 @@ def _compute_day_trade_levels(price: float, atr_pct: float, tech: dict | None = 
 
             rr = round((target - entry) / risk, 1) if risk > 0 else 0
 
-            max_shares = max(1, int(100 / entry))
+            # Display sizing assumes the full capped bankroll; validate_order
+            # enforces the real limit against live equity at order time.
+            max_shares = max(1, int(trade_module.max_position_usd(trade_module.ACCOUNT_CAP_USD) / entry))
             risk_dollars = round(max_shares * risk, 2)
             reward_dollars = round(max_shares * (target - entry), 2)
             reward_pct = round((target - entry) / entry * 100, 2) if entry > 0 else 0
@@ -1993,39 +2000,7 @@ def _compute_day_trade_levels(price: float, atr_pct: float, tech: dict | None = 
     reward     = target - entry
     rr         = round(reward / risk, 1) if risk > 0 else 0
 
-    max_shares    = max(1, int(100 / entry))
-    risk_dollars  = round(max_shares * risk, 2)
-    reward_dollars = round(max_shares * reward, 2)
-    reward_pct    = round(reward / entry * 100, 2)
-
-    return {
-        "entry":          entry,
-        "stop":           stop,
-        "target":         target,
-        "stop_pct":       stop_pct,
-        "reward_pct":     reward_pct,
-        "rr":             rr,
-        "shares":         max_shares,
-        "risk_dollars":   risk_dollars,
-        "reward_dollars": reward_dollars,
-        "exit_time":      "3:45 PM ET",
-    }
-
-    """
-    Pure-Python day trade levels using ATR-based stop.
-    Stop = 0.75× ATR below entry, clamped to 0.5–2%.
-    Target = 3:1 R/R from stop.
-    Position size capped at $100 (10% of $1k account).
-    """
-    stop_pct   = min(max(round(atr_pct * 0.75, 2), 0.5), 2.0)
-    entry      = round(price * 1.001, 2)          # slight limit premium
-    stop       = round(entry * (1 - stop_pct / 100), 2)
-    risk       = entry - stop
-    target     = round(entry + 3 * risk, 2)
-    reward     = target - entry
-    rr         = round(reward / risk, 1) if risk > 0 else 0
-
-    max_shares    = max(1, int(100 / entry))
+    max_shares    = max(1, int(trade_module.max_position_usd(trade_module.ACCOUNT_CAP_USD) / entry))
     risk_dollars  = round(max_shares * risk, 2)
     reward_dollars = round(max_shares * reward, 2)
     reward_pct    = round(reward / entry * 100, 2)

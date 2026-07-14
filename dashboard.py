@@ -692,10 +692,14 @@ def _to_float(value, default=None):
 
 
 def estimate_qty(entry: float, account_value: float | None = None) -> float:
-    """Match the agent's ~$100 max position sizing for proposed trades."""
+    """Match the agent's cap-aware max position sizing for proposed trades."""
     if not entry or entry <= 0:
         return 0.0
-    max_dollars = min(100.0, (account_value or 1000.0) * 0.10)
+    try:
+        import trade as _t
+        max_dollars = _t.max_position_usd(account_value or _t.ACCOUNT_CAP_USD)
+    except Exception:
+        max_dollars = (account_value or 10000.0) * 0.20
     return math.floor((max_dollars / entry) * 100) / 100
 
 
@@ -1482,7 +1486,7 @@ with tab3:
                     target = trade.get("target","—")
                     stop_pct = trade.get("stop_pct","")
                     rr     = trade.get("reward_risk","")
-                    acct_value = account_data.get("account_value") if account_data else 1000.0
+                    acct_value = account_data.get("account_value") if account_data else None
                     proposed_qty = trade.get("qty") or estimate_qty(_to_float(entry), acct_value)
                     quality = compute_trade_quality(
                         entry, stop, target, proposed_qty,
@@ -1821,13 +1825,13 @@ with tab4:
         cash     = account_data.get("cash", 0)
         n_pos    = account_data.get("positions_count", 0)
         cash_pct  = (cash / equity * 100) if equity else 0
-        pnl       = equity - 1000.0
+        pnl       = equity - account_data.get("last_equity", equity)
         market_open = market_data.get("is_open", False) if isinstance(market_data, dict) else False
 
         _r1c1, _r1c2, _r1c3 = st.columns(3)
         _r2c1, _r2c2, _     = st.columns(3)
         _r1c1.metric("Portfolio Value", f"${equity:,.2f}",
-                     delta=f"{pnl:+.2f} vs start",
+                     delta=f"{pnl:+.2f} today",
                      delta_color="normal" if pnl >= 0 else "inverse")
         _r1c2.metric("Cash", f"${cash:,.2f}", f"{cash_pct:.0f}% of equity",
                      delta_color="off")
@@ -2014,8 +2018,10 @@ with tab4:
             line=dict(color="#00d4aa", width=2),
             fill="tozeroy", fillcolor="rgba(0,212,170,0.08)"
         ))
-        fig.add_hline(y=1000, line_dash="dash", line_color="#a0aec0",
-                      annotation_text="Start $1,000", annotation_position="bottom right")
+        _eq_start = float(eq_df["equity"].iloc[0])
+        fig.add_hline(y=_eq_start, line_dash="dash", line_color="#a0aec0",
+                      annotation_text=f"Period start ${_eq_start:,.0f}",
+                      annotation_position="bottom right")
         fig.update_layout(
             yaxis_title="USD", height=280,
             plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",

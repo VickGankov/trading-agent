@@ -55,8 +55,14 @@ UNIVERSE = [
     "TSM",
 ]
 
-ACCOUNT_VALUE = 1000.0
-MAX_POSITION_USD = 100.0  # 10% of $1000 — matches trade.py MAX_POSITION_PCT
+# Sync with trade.py's live sizing (capped bankroll × max position %) so
+# simulated stats stay comparable to what the live agent would actually do.
+try:
+    from trade import ACCOUNT_CAP_USD as ACCOUNT_VALUE, MAX_POSITION_PCT
+    MAX_POSITION_USD = ACCOUNT_VALUE * (MAX_POSITION_PCT / 100.0)
+except Exception:
+    ACCOUNT_VALUE = 10000.0
+    MAX_POSITION_USD = 2000.0
 
 
 def classify_setup(price: float, ma20, ma50, rsi) -> str:

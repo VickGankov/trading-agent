@@ -133,6 +133,7 @@ def get_account():
     return {
         "account_value": float(acct.equity),
         "cash": float(acct.cash),
+        "last_equity": float(acct.last_equity) if acct.last_equity is not None else float(acct.equity),
         "buying_power": float(acct.buying_power),
         "daytrade_count": int(acct.daytrade_count) if acct.daytrade_count is not None else 0,
         "pattern_day_trader": acct.pattern_day_trader,

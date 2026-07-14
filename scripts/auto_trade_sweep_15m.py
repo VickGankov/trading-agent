@@ -21,9 +21,11 @@ import sys
 import json
 import math
 
-# Local imports from repo
-REPO_ROOT = "/home/ubuntu/trading-agent"
-SCRIPTS_DIR = f"{REPO_ROOT}/scripts"
+# Local imports from repo — derive from this file's location so the script
+# runs on the VPS and locally without editing paths.
+from pathlib import Path
+REPO_ROOT = str(Path(__file__).resolve().parent.parent)
+SCRIPTS_DIR = str(Path(__file__).resolve().parent)
 if SCRIPTS_DIR not in sys.path:
     sys.path.insert(0, SCRIPTS_DIR)
 
@@ -292,7 +294,6 @@ def main():
 
             # Pass-2: levels now include structural TP when target_ref == range_mid
             levels = a._compute_day_trade_levels(entry_raw, atr_pct=1.5, tech=tech15)
-            entry_px = round(float(levels["entry"]), 2)
             # Fix rounding so realized stop % never exceeds 2.0% after rounding.
             # We choose stop_px by snapping to 0.01 increments but ensuring stop_pct <= 2.0%.
             entry_px = round(float(levels["entry"]), 2)
@@ -314,39 +315,24 @@ def main():
             if stop_px >= entry_px:
                 continue
 
-            # Effective bankroll cap (paper account may report much larger equity)
-            effective_equity = float(st["equity"])
-            if t.ACCOUNT_CAP_USD:
-                effective_equity = min(effective_equity, float(t.ACCOUNT_CAP_USD))
-
-            max_notional = effective_equity * (t.MAX_POSITION_PCT / 100.0)
-            qty_max = int(max_notional // entry_px)
-            if qty_max < 1:
-                continue
-
             risk = entry_px - stop_px
             if risk <= 0:
                 continue
 
             # Pass-2: TP is structural (from agent levels). We size shares
-            # using shares = floor(target_distance -> 80 / (tp-entry)).
-            # Then clamp by max notional.
+            # using shares = floor(target_profit_cash / (tp-entry)),
+            # then clamp by max notional from the capped bankroll.
 
             target_distance = target_px - entry_px
             if target_distance <= 0:
                 continue
 
-            # baseline sizing: target ~ $80 profit
             qty_base = int((args.target_profit_cash) // target_distance)
             if qty_base < 1:
                 qty_base = 1
 
-            effective_equity = float(st["equity"])
-            if t.ACCOUNT_CAP_USD:
-                effective_equity = min(effective_equity, float(t.ACCOUNT_CAP_USD))
-            max_notional = effective_equity * (t.MAX_POSITION_PCT / 100.0)
-
-            # Clamp to qty that fits max_notional
+            # Effective bankroll cap (paper account may report much larger equity)
+            max_notional = t.max_position_usd(float(st["equity"]))
             qty_max = int(max_notional // entry_px)
             if qty_max < 1:
                 continue
