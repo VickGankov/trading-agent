@@ -21,6 +21,7 @@ import json
 import argparse
 from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 from dotenv import load_dotenv
 
 # Add parent dir to path so we can import sibling scripts
@@ -559,10 +560,54 @@ def _run_groq_cycle(dry_run: bool, premarket: bool, system: str):
 
         setup = classify_setup(live_price, t, data["news"].get(sym, []))
 
+        # ── Check Mark wiring into BUY decisions ─────────────────
+        # If the strict Check Mark long pattern is detected from 15m/5m candles,
+        # override setup + the exact entry/stop/target so the LLM copies them.
+        try:
+            intraday_15m = research.get_intraday_bars(sym, minutes=15, lookback_hours=10)
+            intraday_5m  = research.get_intraday_bars(sym, minutes=5,  lookback_hours=10)
+            bars15 = intraday_15m.get("bars", [])
+            bars5  = intraday_5m.get("bars", [])
+
+            prev_day_high = None
+            prev_day_low = None
+            daily = research.get_bars(sym, days=3).get("bars", [])
+            if len(daily) >= 2:
+                prev_day = daily[-2]
+                prev_day_high = float(prev_day.get("high"))
+                prev_day_low  = float(prev_day.get("low"))
+
+            checkmark_tech = {}
+            if prev_day_high is not None and prev_day_low is not None and bars15 and bars5:
+                checkmark_tech.update(
+                    _compute_check_mark_long_features(
+                        bars15=bars15,
+                        bars5=bars5,
+                        prev_day_high=prev_day_high,
+                        prev_day_low=prev_day_low,
+                    )
+                )
+
+            if checkmark_tech.get("checkmark_long_ready"):
+                atr_pct_local = t.get("atr14_pct") or 1.5
+                levels = _compute_day_trade_levels(live_price, atr_pct_local, tech=checkmark_tech)
+
+                if levels.get("entry") and levels.get("stop") and levels.get("target"):
+                    setup = "Check Mark Long"
+                    entry  = float(levels["entry"])
+                    stop   = float(levels["stop"])
+                    target = float(levels["target"])
+        except Exception:
+            pass
+
         # Pre-compute order parameters — LLM copies these exactly, no arithmetic
-        entry  = round(live_price * 1.001, 2)         # ask + 0.1% to cross spread
-        stop   = round(entry * 0.950, 2)               # 5% stop
-        target = round(entry * 1.100, 2)               # 10% target
+        # (default levels; may be overridden above)
+        if "entry" not in locals():
+            entry  = round(live_price * 1.001, 2)      # ask + 0.1% to cross spread
+        if "stop" not in locals():
+            stop   = round(entry * 0.950, 2)          # 5% stop
+        if "target" not in locals():
+            target = round(entry * 1.100, 2)         # 10% target
         qty    = _math.floor((100.0 / entry) * 100) / 100  # max $100 position, floored
 
         action_hint = "→ BUY" if (setup not in ("NO_SETUP",) and not setup.startswith("REJECT") and not earn_flag) else "→ NO TRADE"
@@ -1245,8 +1290,53 @@ IMPORTANT for options_play:
         day_trade_direction = stock_trade.get("action", "SKIP")
         if day_trade_direction == "BUY" and canonical_price and canonical_price > 0:
             atr_pct  = tech.get("atr14_pct") or 1.5
+
+            # 15-minute + 5-minute chart features for day-trade setup classification
+            # (fallback to existing daily-tech logic if intraday data is missing)
+            try:
+                intraday_15m = research.get_intraday_bars(symbol, minutes=15, lookback_hours=10)
+                intraday_5m  = research.get_intraday_bars(symbol, minutes=5,  lookback_hours=10)
+                bars15 = intraday_15m.get("bars", [])
+                bars5  = intraday_5m.get("bars", [])
+
+                # Previous day OHLC for “blow-off” validation
+                prev_day_high = None
+                prev_day_low = None
+                try:
+                    daily = research.get_bars(symbol, days=3).get("bars", [])
+                    if len(daily) >= 2:
+                        prev_day = daily[-2]
+                        prev_day_high = float(prev_day.get("high"))
+                        prev_day_low  = float(prev_day.get("low"))
+                except Exception:
+                    pass
+
+                # Full Check Mark features when we can
+                if (
+                    prev_day_high is not None
+                    and prev_day_low is not None
+                    and bars15
+                    and len(bars15) >= 10
+                    and bars5
+                    and len(bars5) >= 20
+                ):
+                    tech.update(
+                        _compute_check_mark_long_features(
+                            bars15=bars15,
+                            bars5=bars5,
+                            prev_day_high=prev_day_high,
+                            prev_day_low=prev_day_low,
+                        )
+                    )
+
+                # Always compute simpler 15m fallback features too
+                if bars15 and len(bars15) >= 10:
+                    tech.update(_compute_15m_day_trade_features(bars15))
+            except Exception:
+                pass
+
             setup    = _detect_day_trade_setup(tech)
-            levels   = _compute_day_trade_levels(canonical_price, atr_pct)
+            levels   = _compute_day_trade_levels(canonical_price, atr_pct, tech)
             result["day_trade"] = {
                 "available":     True,
                 "setup_type":    setup,
@@ -1318,12 +1408,30 @@ IMPORTANT for options_play:
 
 
 def _detect_day_trade_setup(tech: dict) -> str:
-    """Classify the intraday setup type from daily technicals. Pure logic, no LLM."""
-    rsi       = tech.get("rsi14") or 50
+    """Backwards-compatible setup classifier (no veto reasons).
+
+
+    Pass 1 adds veto-capable variants, but this function stays stable so
+    existing detectors/sweep behavior doesn't change until Pass 2.
+    """
+    # ── Check Mark (strict long variant) ────────────────────────────────
+    if tech.get("checkmark_long_ready"):
+        return "Check Mark Long"
+
+    # ── 15-minute chart features (preferred) ─────────────────────────
+    if tech.get("reclaimed_15m_high"):
+        return "Reclaim-15m High"
+    if tech.get("broke_15m_range_high"):
+        return "15m Range Breakout"
+    if tech.get("bounced_from_15m_low"):
+        return "15m Low Bounce"
+
+    # ── Fallback: existing daily-tech logic ───────────────────────────
+    rsi = tech.get("rsi14") or 50
     above_ma20 = tech.get("above_ma20", False)
-    vol_ratio  = tech.get("vol_ratio") or 1.0
-    chg5       = tech.get("5d_change_pct") or 0
-    atr_pct    = tech.get("atr14_pct") or 1.5
+    vol_ratio = tech.get("vol_ratio") or 1.0
+    chg5 = tech.get("5d_change_pct") or 0
+    atr_pct = tech.get("atr14_pct") or 1.5
 
     if rsi < 35 and not above_ma20:
         return "Oversold Bounce"
@@ -1338,7 +1446,571 @@ def _detect_day_trade_setup(tech: dict) -> str:
     return "Technical Bounce"
 
 
-def _compute_day_trade_levels(price: float, atr_pct: float) -> dict:
+def _detect_day_trade_setup_veto(tech: dict) -> tuple[str | None, str | None]:
+    """Veto-capable setup detector.
+
+    Returns: (setup_name, veto_reason)
+      - setup_name is None when a setup is vetoed or when no setup matches.
+      - veto_reason is set when a *specific* setup was considered and vetoed.
+
+    IMPORTANT: Pass 1 keeps existing behavior unchanged elsewhere by not
+    switching callers yet.
+    """
+
+    enforce_pdh = bool(tech.get("enforce_pdh_proximity"))
+
+    # New setup: PDL Sweep Reclaim (long)
+    if tech.get("pdl_sweep_reclaim_ready"):
+        # If we computed this flag, we already encoded sweep freshness + depth.
+        return "PDL Sweep Reclaim", None
+
+    # Check Mark (kept high priority)
+    if tech.get("checkmark_long_ready"):
+        return "Check Mark Long", None
+
+    # Reclaim-15m High with PDH proximity veto (optional gating)
+    if tech.get("reclaimed_15m_high"):
+        # Shadow mode: PDH proximity used as a label, not a block.
+        # We still return the setup name so the sweep can execute,
+        # but we attach veto_reason so we can compare cohorts later.
+        veto_reason: str | None = None
+        if enforce_pdh:
+            dist_pct = tech.get("distance_to_pdh_pct")
+            if dist_pct is None:
+                veto_reason = "PDH proximity veto: missing prior day high context"
+            elif dist_pct > 0.5:
+                veto_reason = (
+                    f"PDH proximity veto: distance_to_pdh_pct={dist_pct:.3f}% > 0.5%"
+                )
+        return "Reclaim-15m High", veto_reason
+
+    # Plain 15m features
+    if tech.get("broke_15m_range_high"):
+        return "15m Range Breakout", None
+    if tech.get("bounced_from_15m_low"):
+        return "15m Low Bounce", None
+
+    # No match
+    return None, "no setup matched"
+
+
+def _compute_prior_day_context(daily_bars: list[dict]) -> dict:
+    """Compute prior-day context (PDH/PDL/ATR14%) used by Pass 2 features.
+
+    Expects daily_bars as: [{date, open, high, low, close, volume}, ...]
+    and assumes the last element may be the current (incomplete) day.
+    """
+    if not daily_bars or len(daily_bars) < 5:
+        return {}
+
+    # Drop the last daily bar to avoid partial current-day contamination
+    usable = daily_bars[:-1]
+    if len(usable) < 5:
+        return {}
+
+    prior = usable[-1]
+    prior_high = float(prior.get("high"))
+    prior_low = float(prior.get("low"))
+    prior_close = float(prior.get("close"))
+
+    # ATR14 via True Range over the last 14 usable days (excluding the very first TR seed day).
+    trs = []
+    for i in range(1, len(usable)):
+        cur = usable[i]
+        prev = usable[i - 1]
+        h = float(cur.get("high"))
+        l = float(cur.get("low"))
+        pc = float(prev.get("close"))
+        tr = max(h - l, abs(h - pc), abs(l - pc))
+        if tr > 0:
+            trs.append(tr)
+
+    if not trs:
+        return {}
+
+    atr14 = sum(trs[-14:]) / max(1, min(14, len(trs[-14:])))
+    atr14_pct = (atr14 / prior_close) * 100.0 if prior_close > 0 else None
+
+    return {
+        "prior_day_high": prior_high,
+        "prior_day_low": prior_low,
+        "prior_day_close": prior_close,
+        "atr14": atr14,
+        "atr14_pct": atr14_pct,
+        "prior_day_range": prior_high - prior_low,
+        "prior_day_range_pct": (prior_high - prior_low) / prior_close * 100.0 if prior_close > 0 else None,
+    }
+
+
+def _compute_15m_day_trade_features(bars15: list[dict], ctx: dict | None = None) -> dict:
+    """Compute 15m intraday swing/breakout features.
+
+    Pass-1 behavior:
+      - When ctx is None: preserves current feature set (no session slicing).
+      - When ctx is provided (session_aware=true): derives session-aware
+        bars15_today and adds range/high/low + distance-to-PDH.
+
+    NOTE: This is intentionally conservative to avoid breaking existing
+    callers in Pass 1.
+    """
+
+    if not bars15 or len(bars15) < 10:
+        return {}
+
+    # ---- Optional session-aware slicing (ctx-gated) --------------
+    bars_use = bars15
+    if ctx is not None and ctx.get("session_aware", True):
+        try:
+            et = ZoneInfo("America/New_York")
+
+            def _to_et_iso(b: dict) -> str | None:
+                ts = b.get("timestamp")
+                if not ts:
+                    return None
+                try:
+                    # Alpaca timestamps are usually ISO with tz (UTC). If naive,
+                    # treat as UTC.
+                    dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                    if dt.tzinfo is None:
+                        dt = dt.replace(tzinfo=ZoneInfo("UTC"))
+                    return dt.astimezone(et).isoformat()
+                except Exception:
+                    return None
+
+            today_et_date = None
+            # Determine "today" from last bar (DST-safe)
+            last_et = _to_et_iso(bars15[-1])
+            if last_et:
+                today_et_date = last_et.split("T")[0]
+
+            if today_et_date:
+                bars_today = []
+                for b in bars15:
+                    et_ts = _to_et_iso(b)
+                    if not et_ts:
+                        continue
+                    if et_ts.split("T")[0] == today_et_date:
+                        bars_today.append(b)
+
+                # Require enough bars for stable features
+                if len(bars_today) >= 10:
+                    bars_use = bars_today
+        except Exception:
+            # If anything fails, keep original bars15 (don't block Pass 1).
+            bars_use = bars15
+
+    # ---- Feature computation (from existing logic) -------------
+    highs = [float(b.get("high")) for b in bars_use if b.get("high") is not None]
+    lows = [float(b.get("low")) for b in bars_use if b.get("low") is not None]
+    closes = [float(b.get("close")) for b in bars_use if b.get("close") is not None]
+
+    if len(closes) < 10 or len(highs) < 10 or len(lows) < 10:
+        return {}
+
+    n = min(len(highs), len(lows), len(closes))
+    highs, lows, closes = highs[-n:], lows[-n:], closes[-n:]
+
+    last_close = closes[-1]
+    prev_close = closes[-2]
+
+    range_window = min(10, len(closes) - 2)
+    if range_window <= 1:
+        return {}
+
+    prev_slice = slice(-(range_window + 1), -1)
+    range_high = max(highs[prev_slice])
+    range_low = min(lows[prev_slice])
+
+    broke_15m_range_high = bool(prev_close <= range_high and last_close > range_high)
+
+    w = 2
+    pivot_highs = []
+    pivot_lows = []
+    for i in range(w, len(closes) - w):
+        if highs[i] == max(highs[i - w:i + w + 1]):
+            pivot_highs.append((i, highs[i]))
+        if lows[i] == min(lows[i - w:i + w + 1]):
+            pivot_lows.append((i, lows[i]))
+
+    last_pivot_high = pivot_highs[-1][1] if pivot_highs else None
+    last_pivot_low = pivot_lows[-1][1] if pivot_lows else None
+
+    buffer_pct = 0.002
+    reclaimed_15m_high = (
+        bool(last_pivot_high is not None
+             and prev_close <= last_pivot_high * (1 + buffer_pct)
+             and last_close > last_pivot_high * (1 + buffer_pct))
+    )
+
+    bounced_from_15m_low = (
+        bool(last_pivot_low is not None
+             and prev_close >= last_pivot_low * (1 - buffer_pct)
+             and last_close > last_pivot_low * (1 - buffer_pct)
+             and min(closes[-5:]) <= last_pivot_low * (1 + buffer_pct))
+    )
+
+    tech = {
+        "reclaimed_15m_high": reclaimed_15m_high,
+        "broke_15m_range_high": broke_15m_range_high,
+        "bounced_from_15m_low": bounced_from_15m_low,
+        "last_pivot_high": last_pivot_high,
+        "last_pivot_low": last_pivot_low,
+    }
+
+    # --- Spec E: PDH-proximity gating inputs (ctx-gated) ---------
+    if ctx is not None:
+        pdh = ctx.get("prior_day_high")
+        if pdh and pdh > 0:
+            tech["distance_to_pdh_pct"] = ((last_close - float(pdh)) / float(pdh)) * 100.0
+            tech["enforce_pdh_proximity"] = True
+
+        # --- Spec D: PDL Sweep Reclaim (ctx-gated) --------------
+        # Detect a session-low sweep below prior day low, then require
+        # a reclaim to near/above the sweep_low within a freshness window.
+        pdl = ctx.get("prior_day_low")
+        atr14_pct = ctx.get("atr14_pct")
+
+        if pdl and pdl > 0:
+            pdl = float(pdl)
+            # Sweep threshold: scale by ATR% when available; fall back to a small fixed band.
+            if atr14_pct and atr14_pct > 0:
+                # ~0.1% of PDL adjusted by ATR% magnitude
+                sweep_thresh = max(pdl * 0.001, pdl * (atr14_pct / 100.0) * 0.05)
+            else:
+                sweep_thresh = max(pdl * 0.001, 0.01)
+
+            # Session high/low for TP structure
+            session_high = float(max(highs))
+            session_low = float(min(lows))
+            tech["session_high"] = session_high
+            tech["session_low"] = session_low
+
+            sweep_idx = None
+            sweep_low = None
+            for i in range(len(bars_use)):
+                lo = bars_use[i].get("low")
+                if lo is None:
+                    continue
+                lo = float(lo)
+                if sweep_idx is None:
+                    if lo <= pdl - sweep_thresh:
+                        sweep_idx = i
+                        sweep_low = lo
+                else:
+                    sweep_low = min(sweep_low, lo)
+
+            # Reclaim rule: last_close reclaims above sweep_low by buffer
+            reclaim_buffer = max(0.002 * float(sweep_low), 0.01) if sweep_low else 0.0
+            freshness_bars = int(ctx.get("reclaim_freshness_bars", 5)) if ctx else 5
+
+            pdl_sweep_reclaim_ready = False
+            if sweep_idx is not None and sweep_low is not None:
+                bars_since_sweep = (len(bars_use) - 1) - sweep_idx
+                if bars_since_sweep <= max(0, freshness_bars):
+                    if last_close >= (sweep_low + reclaim_buffer):
+                        # Additional depth guard: ensure sweep wasn't just a tiny poke.
+                        sweep_depth_pct = (pdl - sweep_low) / pdl * 100.0
+                        if sweep_depth_pct >= ctx.get("min_sweep_depth_pct", 0.3):
+                            pdl_sweep_reclaim_ready = True
+                            tech["sweep_depth_pct"] = sweep_depth_pct
+
+            tech["pdl_sweep_low"] = float(sweep_low) if sweep_low is not None else None
+            tech["pdl_sweep_reclaim_ready"] = bool(pdl_sweep_reclaim_ready)
+            tech["pdl_sweep_freshness_bars"] = int(bars_since_sweep) if sweep_idx is not None else None
+            # Target structure selector for Pass 2 levels
+            if pdl_sweep_reclaim_ready:
+                tech["target_ref"] = "range_mid"
+
+    return tech
+
+
+def _compute_check_mark_long_features(
+    bars15: list[dict],
+    bars5: list[dict],
+    prev_day_high: float,
+    prev_day_low: float,
+) -> dict:
+    """Strict long “Check Mark” pattern detector.
+
+    Returns a dict that _detect_day_trade_setup() / _compute_day_trade_levels()
+    can consume, or {} if conditions aren't met.
+
+    Notes/approximations (due to available bar data in this codebase):
+    - Uses the FIRST available 15m candle as the “opening range” check.
+    - Treats a long blow-off as the opening candle taking out the PRIOR DAY low.
+    """
+    try:
+        if not bars15 or not bars5:
+            return {}
+        if len(bars15) < 15 or len(bars5) < 20:
+            return {}
+
+        highs15 = [float(b.get("high")) for b in bars15 if b.get("high") is not None]
+        lows15 = [float(b.get("low")) for b in bars15 if b.get("low") is not None]
+        closes15 = [float(b.get("close")) for b in bars15 if b.get("close") is not None]
+        vols15 = [float(b.get("volume") or 0.0) for b in bars15 if b.get("volume") is not None]
+
+        # Volume participation gate:
+        # Require the latest 15m bar to have meaningfully elevated volume vs the prior bars.
+        # This reduces false positives in the Check Mark strict pattern detector.
+        if len(vols15) >= 5:
+            last_vol = vols15[-1]
+            prev_avg_vol = sum(vols15[:-1]) / max(1, len(vols15[:-1]))
+            if prev_avg_vol > 0:
+                vol_ratio = last_vol / prev_avg_vol
+                if vol_ratio < 1.2:
+                    return {}
+
+        if len(highs15) < 15 or len(lows15) < 15 or len(closes15) < 15:
+            return {}
+
+        # Day-so-far range from available 15m bars (proxy)
+        day_high = max(highs15)
+        day_low = min(lows15)
+
+        opening15 = bars15[0]
+        op_high = float(opening15.get("high"))
+        op_low = float(opening15.get("low"))
+        op_close = float(opening15.get("close"))
+        candle_range = op_high - op_low
+
+        # ATR(15m) approximation via TR mean
+        trs = []
+        for i in range(1, len(bars15)):
+            h = float(bars15[i].get("high"))
+            l = float(bars15[i].get("low"))
+            pc = float(bars15[i - 1].get("close"))
+            tr = max(h - l, abs(h - pc), abs(l - pc))
+            trs.append(float(tr))
+        if len(trs) < 2:
+            return {}
+        atr15 = sum(trs[-14:]) / min(14, len(trs))
+        if atr15 <= 0:
+            return {}
+
+        # Check: manipulation candle if range > 20% of ATR
+        is_manipulation = (candle_range / atr15) >= 0.20
+        if not is_manipulation:
+            return {}
+
+        # Blow-off (LONG): opening candle takes out prior day low
+        # small tolerance to avoid floating noise
+        tol_prev = max(prev_day_low * 0.0005, 0.01)
+        is_blowoff_low = op_low <= (prev_day_low - tol_prev)
+        if not is_blowoff_low:
+            return {}
+
+        blowoff_low = op_low
+
+        # Pivot/double-test on 5m: two touches near blow-off low
+        highs5 = [float(b.get("high")) for b in bars5 if b.get("high") is not None]
+        lows5 = [float(b.get("low")) for b in bars5 if b.get("low") is not None]
+        closes5 = [float(b.get("close")) for b in bars5 if b.get("close") is not None]
+        opens5 = [float(b.get("open")) for b in bars5 if b.get("open") is not None]
+        if len(highs5) < 30 or len(lows5) < 30 or len(closes5) < 30 or len(opens5) < 30:
+            return {}
+
+        last_close_5m = closes5[-1]
+        tol = max(blowoff_low * 0.002, 0.01)
+
+        # Touch = low tags blowoff + close shows acceptance
+        touch_idxs = []
+        for i in range(len(lows5)):
+            if lows5[i] <= blowoff_low + tol and closes5[i] >= blowoff_low - tol:
+                touch_idxs.append(i)
+
+        if len(touch_idxs) < 2:
+            return {}
+
+        # pick two touches separated by >=2 bars
+        touch1 = touch_idxs[0]
+        touch2 = None
+        for j in touch_idxs[1:]:
+            if j - touch1 >= 2:
+                touch2 = j
+                break
+        if touch2 is None:
+            return {}
+
+        # Ensure price has started to accept/reverse after second touch
+        if not (last_close_5m > blowoff_low + tol * 0.1):
+            return {}
+
+        # Entry rule: close above high of previous RED candle
+        # Search after touch2
+        red_high = None
+        for i in range(touch2 + 1, len(closes5) - 1):
+            if closes5[i] < opens5[i]:
+                red_high = highs5[i]
+
+        if red_high is None:
+            return {}
+
+        entry_ready = last_close_5m > red_high
+        if not entry_ready:
+            return {}
+
+        # Stop just outside wick (below blow-off low)
+        stop_ref = blowoff_low - tol * 0.3
+
+        # Target proxy: median of day range
+        target_ref = (day_high + day_low) / 2.0
+
+        # Exit guard: require sensible ordering
+        # If the target proxy collapses below the entry ref candle, bump it slightly
+        # so we can form a valid R:R on realistic intraday ranges.
+        if target_ref <= red_high:
+            target_ref = red_high * 1.01
+
+        if not (stop_ref < red_high < target_ref):
+            return {}
+
+        return {
+            "checkmark_long_ready": True,
+            "checkmark_stop_ref_price": float(stop_ref),
+            "checkmark_entry_ref_price": float(red_high),
+            "checkmark_target_ref_price": float(target_ref),
+        }
+
+    except Exception:
+        return {}
+
+
+def _compute_day_trade_levels(price: float, atr_pct: float, tech: dict | None = None) -> dict:
+    """Pure-Python day trade levels.
+
+    Pass-1: keeps existing Check Mark + ATR fallback.
+    Pass-1 also adds a structural target path for:
+      - target_ref == "range_mid" (PDL Sweep Reclaim)
+
+    Note: In Pass 2, the sweep script will compute shares using the
+    structural TP distance; this function only sets entry/stop/target.
+    """
+
+    tech = tech or {}
+
+    # Structural sizing/TP logic expects a stable entry basis.
+    entry = round(float(price) * 1.001, 2)
+
+    # ── PDL Sweep Reclaim (range_mid target path) ───────────────────────
+    if tech.get("target_ref") == "range_mid":
+        try:
+            sweep_low = tech.get("pdl_sweep_low")
+            session_high = tech.get("session_high")
+            if sweep_low is not None and session_high is not None:
+                sweep_low = float(sweep_low)
+                session_high = float(session_high)
+
+                # Spec F:
+                #   stop = sweep_low * 0.998
+                #   tp   = (session_high + stop) / 2
+                stop = round(sweep_low * 0.998, 2)
+                target = round((session_high + stop) / 2.0, 2)
+
+                if stop <= 0 or target <= 0:
+                    return {}
+                if stop >= entry or target <= entry:
+                    return {}
+
+                risk = entry - stop
+                reward = target - entry
+                rr = round(reward / risk, 2) if risk > 0 else 0
+
+                # RR-fail => reject (do not TP-widen)
+                from scripts.trade import MIN_RR_RATIO
+                if rr < MIN_RR_RATIO:
+                    return {}
+
+                stop_pct = round(((entry - stop) / entry) * 100.0, 3) if entry > 0 else None
+                reward_pct = round((reward / entry) * 100.0, 3) if entry > 0 else None
+
+                return {
+                    "entry": entry,
+                    "stop": stop,
+                    "target": target,
+                    "stop_pct": stop_pct,
+                    "reward_pct": reward_pct,
+                    "rr": rr,
+                    "risk_dollars": None,
+                    "reward_dollars": None,
+                    "shares": None,
+                    "exit_time": "3:45 PM ET",
+                }
+        except Exception:
+            return {}
+
+    # ── Check Mark overrides ────────────────────────────────────────────
+    if tech.get("checkmark_long_ready"):
+
+        entry_ref = float(tech.get("checkmark_entry_ref_price") or 0)
+        stop_ref = float(tech.get("checkmark_stop_ref_price") or 0)
+        target_ref = float(tech.get("checkmark_target_ref_price") or 0)
+        if entry_ref > 0 and stop_ref > 0 and target_ref > 0:
+            # limit premium for entry to cross spread
+            entry = round(entry_ref * 1.001, 2)
+
+            # Clamp stop % into allowed day-trade band [0.5%, 2.0%]
+            raw_stop_pct = ((entry - stop_ref) / entry) * 100
+            min_stop_pct = 0.5
+            max_stop_pct = 2.0
+            stop_pct = min(max(round(raw_stop_pct, 2), min_stop_pct), max_stop_pct)
+            stop = round(entry * (1 - stop_pct / 100), 2)
+
+            risk = entry - stop
+            if risk > 0:
+                # RR: target must be >= 1.5x risk above entry (validate_order uses MIN_RR=1.5)
+                min_target = entry + 1.5 * risk
+                target = round(max(target_ref, min_target), 2)
+            else:
+                target = round(entry * 1.03, 2)
+
+            rr = round((target - entry) / risk, 1) if risk > 0 else 0
+
+            max_shares = max(1, int(100 / entry))
+            risk_dollars = round(max_shares * risk, 2)
+            reward_dollars = round(max_shares * (target - entry), 2)
+            reward_pct = round((target - entry) / entry * 100, 2) if entry > 0 else 0
+
+            return {
+                "entry": entry,
+                "stop": stop,
+                "target": target,
+                "stop_pct": stop_pct,
+                "reward_pct": reward_pct,
+                "rr": rr,
+                "shares": max_shares,
+                "risk_dollars": risk_dollars,
+                "reward_dollars": reward_dollars,
+                "exit_time": "3:45 PM ET",
+            }
+
+    # ── Fallback: existing ATR-based levels ─────────────────────────────
+    stop_pct   = min(max(round(atr_pct * 0.75, 2), 2), 2.0)
+    entry      = round(price * 1.001, 2)          # slight limit premium
+    stop       = round(entry * (1 - stop_pct / 100), 2)
+    risk       = entry - stop
+    target     = round(entry + 3 * risk, 2)
+    reward     = target - entry
+    rr         = round(reward / risk, 1) if risk > 0 else 0
+
+    max_shares    = max(1, int(100 / entry))
+    risk_dollars  = round(max_shares * risk, 2)
+    reward_dollars = round(max_shares * reward, 2)
+    reward_pct    = round(reward / entry * 100, 2)
+
+    return {
+        "entry":          entry,
+        "stop":           stop,
+        "target":         target,
+        "stop_pct":       stop_pct,
+        "reward_pct":     reward_pct,
+        "rr":             rr,
+        "shares":         max_shares,
+        "risk_dollars":   risk_dollars,
+        "reward_dollars": reward_dollars,
+        "exit_time":      "3:45 PM ET",
+    }
+
     """
     Pure-Python day trade levels using ATR-based stop.
     Stop = 0.75× ATR below entry, clamped to 0.5–2%.

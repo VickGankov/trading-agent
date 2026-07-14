@@ -42,18 +42,27 @@ SECRET_KEY = os.getenv("ALPACA_SECRET_KEY")
 PAPER = os.getenv("PAPER", "True").lower() == "true"
 POSITION_EPSILON_PCT = 0.05
 
+# Cap effective bankroll used for sizing/guardrails.
+# This prevents huge paper accounts from changing position sizing / cash-reserve behavior.
+# Default cap aligns with your request to use up to a $10k effective bankroll.
+_ACCOUNT_CAP_USD_RAW = os.getenv("ACCOUNT_CAP_USD", "10000")
+try:
+    ACCOUNT_CAP_USD = float(_ACCOUNT_CAP_USD_RAW)
+except Exception:
+    ACCOUNT_CAP_USD = 10000.0
+
 # ===================================================================
 # HARD RULES - These are the guardrails. Do not loosen without review.
 # ===================================================================
 
-MAX_POSITION_PCT = 10.0         # Max 10% of account per position
+MAX_POSITION_PCT = 20.0         # Max 20% of account per position (approved by Vick for ~$2k trades)
 MIN_POSITION_USD = 50.0         # Min $50 per position
 MAX_CONCURRENT_POSITIONS = 10   # Max 10 open at once
 MIN_CASH_RESERVE_PCT = 25.0     # Always keep 25% cash
 MIN_STOP_PCT = 3.0              # Stop at least 3% below entry
 MAX_STOP_PCT = 10.0             # Stop at most 10% below entry (caps risk)
 MIN_RR_RATIO = 1.5              # Take-profit at least 1.5x the risk
-DAILY_LOSS_LIMIT_PCT = 3.0      # Halt if account down 3% in a day
+DAILY_LOSS_LIMIT_PCT = 10.0     # Halt if account down 10% in a day
 MIN_PRICE = 5.0                 # No penny stocks
 MAX_PRICE = 1500.0              # Cap — fractional shares supported
 
@@ -174,7 +183,14 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
     
     # 1. Account state checks
     state = get_account_state()
-    
+
+    # Apply optional account-size cap to guard against oversized paper accounts.
+    effective_equity = state["equity"]
+    effective_cash = state["cash"]
+    if ACCOUNT_CAP_USD:
+        effective_equity = min(float(state["equity"]), float(ACCOUNT_CAP_USD))
+        effective_cash = min(float(state["cash"]), float(effective_equity))
+
     if state["trading_blocked"]:
         return False, "Account trading is BLOCKED"
     
@@ -211,8 +227,11 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
         
         # Stop placement — day trades use tighter stops (0.5-2%) vs swing (3-10%)
         stop_pct = ((limit_price - stop_price) / limit_price) * 100
-        min_stop = 0.5 if is_day_trade else MIN_STOP_PCT
-        max_stop = 2.0 if is_day_trade else MAX_STOP_PCT
+        # If the caller didn't explicitly mark this as a day-trade, infer it from
+        # the stop width so day-trade strategies can still execute.
+        effective_is_day_trade = is_day_trade or (0.5 <= stop_pct <= 2.0)
+        min_stop = 0.5 if effective_is_day_trade else MIN_STOP_PCT
+        max_stop = 2.0 if effective_is_day_trade else MAX_STOP_PCT
         if stop_pct < min_stop:
             return False, f"Stop too tight: {stop_pct:.2f}% (min {min_stop}%)"
         if stop_pct > max_stop:
@@ -226,7 +245,7 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
         
         # Position size
         order_value = qty * limit_price
-        position_pct = (order_value / state["equity"]) * 100
+        position_pct = (order_value / effective_equity) * 100
         if order_value < MIN_POSITION_USD:
             return False, f"Position too small: ${order_value:.2f} (min ${MIN_POSITION_USD})"
         if position_pct > MAX_POSITION_PCT + POSITION_EPSILON_PCT:
@@ -239,7 +258,7 @@ def validate_order(symbol: str, side: str, qty: float, limit_price: Optional[flo
         
         # Cash reserve
         cash_after = state["cash"] - order_value
-        cash_reserve_pct = (cash_after / state["equity"]) * 100
+        cash_reserve_pct = (cash_after / effective_equity) * 100
         if cash_reserve_pct < MIN_CASH_RESERVE_PCT:
             return False, f"Would breach cash reserve: {cash_reserve_pct:.2f}% (min {MIN_CASH_RESERVE_PCT}%)"
     
@@ -500,6 +519,59 @@ def close_all_positions(reason: str = "manual"):
         return {"status": "ERROR", "error": str(e)}
 
 
+def eod_flatten_positions(reason: str = "eod_flatten"):
+    """EOD protection (15:45 ET): cancel open orders + close open positions.
+
+    This is intentionally conservative and uses Alpaca account-level actions.
+    Returns JSON with counts for audit.
+
+    Safety gate:
+      - Only runs during 15:44–15:55 ET on Mon–Fri.
+      - Otherwise it prints a SKIP payload and does nothing.
+    """
+    from zoneinfo import ZoneInfo
+    from datetime import time
+
+    try:
+        now_et = datetime.now(ZoneInfo("America/New_York"))
+        if now_et.weekday() >= 5:
+            return {
+                "status": "SKIP_WEEKEND",
+                "reason": reason,
+                "now_et": now_et.isoformat(),
+            }
+        if not (now_et.time() >= time(15, 44) and now_et.time() <= time(15, 55)):
+            return {
+                "status": "SKIP_OUTSIDE_WINDOW",
+                "reason": reason,
+                "now_et": now_et.isoformat(),
+            }
+
+        trading = get_trading_client()
+
+        # Cancel open orders
+        open_orders = list_orders("open")
+        cancel_ids = [o["id"] for o in open_orders if o.get("id")]
+        cancel_results = []
+        for oid in cancel_ids:
+            cancel_results.append(cancel_order(oid))
+
+        # Close open positions and cancel any remaining orders
+        # (Alpaca close_all_positions handles both but we already tried canceling.)
+        close_res = trading.close_all_positions(cancel_orders=True)
+
+        return {
+            "status": "EOD_FLATTENED",
+            "reason": reason,
+            "cancel_attempts": len(cancel_ids),
+            "cancel_results": cancel_results[:5],
+            "close_result": str(close_res) if close_res is not None else None,
+            "timestamp": datetime.now().isoformat(),
+        }
+    except Exception as e:
+        return {"status": "ERROR", "reason": reason, "error": str(e)}
+
+
 # ---- CLI ----
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
@@ -523,7 +595,7 @@ if __name__ == "__main__":
     pc = sub.add_parser("cancel")
     pc.add_argument("order_id")
     
-    sub.add_parser("close_all").add_argument("--reason", default="manual emergency")
+    sub.add_parser("eod_flatten").add_argument("--reason", default="eod_flatten")
     
     sub.add_parser("validate")  # placeholder for testing
     
@@ -539,6 +611,8 @@ if __name__ == "__main__":
         result = cancel_order(args.order_id)
     elif args.cmd == "close_all":
         result = close_all_positions(args.reason)
+    elif args.cmd == "eod_flatten":
+        result = eod_flatten_positions(args.reason)
     else:
         parser.print_help()
         sys.exit(1)

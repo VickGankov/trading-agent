@@ -264,9 +264,17 @@ st.markdown("""
 
     /* Mover cards */
     .mover-card {
-        display:flex; align-items:center; gap:12px;
+        display:flex; align-items:flex-start; gap:12px;
         background:#161b2e; border:1px solid #2d3250; border-left:3px solid #4a5568;
-        border-radius:10px; padding:10px 14px; margin-bottom:8px;
+        border-radius:12px; padding:12px 14px; margin-bottom:10px;
+        box-shadow: 0 6px 18px rgba(0,0,0,0.18);
+        transition: transform 120ms ease, box-shadow 120ms ease, border-color 120ms ease;
+    }
+
+    .mover-card:hover {
+        transform: translateY(-1px);
+        box-shadow: 0 10px 24px rgba(0,0,0,0.28);
+        border-color:#3b4163;
     }
     .mover-card.up   { border-left-color:#00d4aa; }
     .mover-card.down { border-left-color:#ff4b4b; }
@@ -292,7 +300,17 @@ st.markdown("""
     }
     .mover-catalyst a { color:#a0aec0; text-decoration:none; }
     .mover-catalyst a:hover { color:#e2e8f0; text-decoration:underline; }
-    .mover-catalyst-text { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; flex:1; min-width:0; }
+    .mover-catalyst-text {
+        overflow:hidden;
+        text-overflow:ellipsis;
+        display:-webkit-box;
+        -webkit-line-clamp:2;
+        -webkit-box-orient:vertical;
+        white-space:normal;
+        flex:1;
+        min-width:0;
+        line-height:1.25;
+    }
     .mover-catalyst-text.mover-none { color:#4a5568; font-style:italic; }
     .mover-flash { color:#f6ad55; flex-shrink:0; }
     .mover-flash svg { width:12px; height:12px; }
@@ -321,13 +339,25 @@ st.markdown("""
         [data-testid="stMetricValue"] { font-size:1.1em !important; }
         [data-testid="stMetricLabel"] { font-size:0.62em !important; }
         [data-testid="stDataFrame"]   { overflow-x:auto !important; }
-        .mover-card { flex-wrap:wrap; }
+        .mover-card {
+            flex-direction: column;
+            flex-wrap: nowrap;
+        }
         .mover-catalyst {
             border-left:none !important; padding-left:0 !important;
             margin-top:6px; width:100%; padding-top:6px;
             border-top:1px solid #1e2535;
         }
-        .mover-catalyst-text { white-space:normal !important; }
+
+        /* Mobile: show the full catalyst headline (no 2-line clamp) */
+        .mover-catalyst-text {
+            white-space:normal !important;
+            display:block !important;
+            -webkit-line-clamp: unset !important;
+            -webkit-box-orient: unset !important;
+            overflow:visible !important;
+            text-overflow:unset !important;
+        }
     }
 </style>
 """, unsafe_allow_html=True)
@@ -878,10 +908,13 @@ with tab1:
             f'</div>'
         )
 
-    def _render_mover_list(movers: list, empty_msg: str, limit: int = 5):
+    def _render_mover_list(movers: list, empty_msg: str, limit: int = 5, section_label: str = ""):
         if not movers:
             st.caption(empty_msg)
             return
+
+        if "intraday_selected_card" not in st.session_state:
+            st.session_state["intraday_selected_card"] = None
 
         # Rank by magnitude, with a bonus for genuine catalyst-backed moves so a
         # smaller but news-driven move can outrank a bigger move with no story behind it.
@@ -893,8 +926,117 @@ with tab1:
         )
         top, rest = ranked[:limit], ranked[limit:]
 
-        st.markdown("".join(_mover_card_html(m, i + 1) for i, m in enumerate(top)),
-                    unsafe_allow_html=True)
+        for i, m in enumerate(top):
+            rank = i + 1
+            sym = m["ticker"]
+            card_id = f"{section_label}:{sym}" if section_label else sym
+
+            st.markdown(_mover_card_html(m, rank), unsafe_allow_html=True)
+
+            current = st.session_state.get("intraday_selected_card") == card_id
+            btn_key = f"intraday_ticker_{card_id}_{rank}"
+            # Toggle: click ticker again to collapse the chart.
+            if st.button(f"MACD + 5-min chart ({sym}) {('▾' if current else '▸')}",
+                         key=btn_key, use_container_width=True):
+                st.session_state["intraday_selected_card"] = None if current else card_id
+
+            if st.session_state.get("intraday_selected_card") == card_id:
+                _bars, _macd, _src = _load_intraday(sym)
+
+                if _bars:
+                    from plotly.subplots import make_subplots
+
+                    _ts    = [b["timestamp"] for b in _bars]
+                    _opens = [b["open"] for b in _bars]
+                    _highs = [b["high"] for b in _bars]
+                    _lows  = [b["low"] for b in _bars]
+                    _cls   = [b["close"] for b in _bars]
+
+                    _has_macd = "macd" in _macd and len(_macd["macd"]) == len(_bars)
+                    _rows = 2 if _has_macd else 1
+
+                    _fig_intra = make_subplots(
+                        rows=_rows, cols=1, shared_xaxes=True,
+                        row_heights=[0.65, 0.35] if _has_macd else [1],
+                        vertical_spacing=0.04,
+                    )
+
+                    _fig_intra.add_trace(
+                        go.Candlestick(
+                            x=_ts, open=_opens, high=_highs, low=_lows, close=_cls,
+                            increasing_line_color="#48bb78",
+                            decreasing_line_color="#fc8181",
+                            increasing_fillcolor="#48bb78",
+                            decreasing_fillcolor="#fc8181",
+                            name="Price",
+                            showlegend=False,
+                        ),
+                        row=1, col=1,
+                    )
+
+                    if _has_macd:
+                        _hvals = _macd["histogram"]
+                        _fig_intra.add_trace(
+                            go.Bar(
+                                x=_ts, y=_hvals,
+                                marker_color=["#48bb78" if v >= 0 else "#fc8181" for v in _hvals],
+                                name="Histogram",
+                                showlegend=False,
+                            ),
+                            row=2, col=1,
+                        )
+                        _fig_intra.add_trace(
+                            go.Scatter(
+                                x=_ts, y=_macd["macd"],
+                                line=dict(color="#90cdf4", width=1.5),
+                                name="MACD",
+                                showlegend=False,
+                            ),
+                            row=2, col=1,
+                        )
+                        _fig_intra.add_trace(
+                            go.Scatter(
+                                x=_ts, y=_macd["signal"],
+                                line=dict(color="#f6ad55", width=1.5, dash="dot"),
+                                name="Signal",
+                                showlegend=False,
+                            ),
+                            row=2, col=1,
+                        )
+
+                    _fig_intra.update_layout(
+                        height=420 if _has_macd else 280,
+                        margin=dict(l=0, r=0, t=8, b=4),
+                        paper_bgcolor="rgba(0,0,0,0)",
+                        plot_bgcolor="rgba(0,0,0,0)",
+                        font=dict(color="#e2e8f0", size=11),
+                        xaxis_rangeslider_visible=False,
+                    )
+                    _fig_intra.update_xaxes(gridcolor="#2d3748", showgrid=True)
+                    _fig_intra.update_yaxes(gridcolor="#2d3748", showgrid=True)
+
+                    st.plotly_chart(_fig_intra, width='stretch', config={"staticPlot": True})
+
+                    if _has_macd:
+                        _sig = _macd.get("signal_str", "")
+                        _verdicts = {
+                            "bullish_crossover": ("🟢", "Bullish crossover — momentum just turned up", "#1a3a2a", "#48bb78"),
+                            "bearish_crossover": ("🔴", "Bearish crossover — momentum just turned down", "#3a1a1a", "#fc8181"),
+                            "bullish_trend":     ("🔵", "Above signal line — uptrend in progress", "#1a2a3a", "#90cdf4"),
+                            "bearish_trend":     ("⚪", "Below signal line — downtrend in progress", "#1e2130", "#718096"),
+                        }
+                        _icon, _text, _bg, _border = _verdicts.get(_sig, ("⚪", _sig, "#1e2130", "#718096"))
+                        _zero = "MACD above zero ✓" if _macd.get("above_zero") else "MACD below zero"
+                        st.markdown(
+                            f'<div class="macd-verdict" style="background:{_bg};border-left-color:{_border}">'
+                            f'{_icon} <strong>{sym}</strong> — {_text} &nbsp;·&nbsp; {_zero}</div>',
+                            unsafe_allow_html=True,
+                        )
+
+                    if _src == "yfinance_delayed":
+                        st.caption("⚠️ Alpaca returned no IEX data — using yfinance (15-min delay)")
+                else:
+                    st.caption(f"No intraday data available for {sym} yet.")
 
         if rest:
             with st.expander(f"Show {len(rest)} more"):
@@ -925,86 +1067,9 @@ with tab1:
     _render_mover_list(_market_movers, "No market-wide movers available right now.")
 
     # ── 5-min Chart + MACD ───────────────────────────────────────────────────
-    _all_movers = _watchlist_movers + _market_movers
-    if _all_movers:
-        from plotly.subplots import make_subplots
+    # Moved to inline per-card buttons inside _render_mover_list so on mobile
+    # the chart expands where you tap, not at the bottom of the page.
 
-        _ticker_options = [m["ticker"] for m in _all_movers]
-        _selected = st.selectbox("📈 5-min chart + MACD", _ticker_options,
-                                 key="intraday_select")
-
-        _bars, _macd, _src = _load_intraday(_selected)
-
-        if _bars:
-            _ts    = [b["timestamp"] for b in _bars]
-            _opens = [b["open"]  for b in _bars]
-            _highs = [b["high"]  for b in _bars]
-            _lows  = [b["low"]   for b in _bars]
-            _cls   = [b["close"] for b in _bars]
-
-            _has_macd = "macd" in _macd and len(_macd["macd"]) == len(_bars)
-
-            _rows = 2 if _has_macd else 1
-            _fig_intra = make_subplots(
-                rows=_rows, cols=1, shared_xaxes=True,
-                row_heights=[0.65, 0.35] if _has_macd else [1],
-                vertical_spacing=0.04,
-            )
-            _fig_intra.add_trace(go.Candlestick(
-                x=_ts, open=_opens, high=_highs, low=_lows, close=_cls,
-                increasing_line_color="#48bb78", decreasing_line_color="#fc8181",
-                increasing_fillcolor="#48bb78", decreasing_fillcolor="#fc8181",
-                name="Price", showlegend=False,
-            ), row=1, col=1)
-            if _has_macd:
-                _hvals = _macd["histogram"]
-                _fig_intra.add_trace(go.Bar(
-                    x=_ts, y=_hvals,
-                    marker_color=["#48bb78" if v >= 0 else "#fc8181" for v in _hvals],
-                    name="Histogram", showlegend=False,
-                ), row=2, col=1)
-                _fig_intra.add_trace(go.Scatter(
-                    x=_ts, y=_macd["macd"],
-                    line=dict(color="#90cdf4", width=1.5),
-                    name="MACD", showlegend=False,
-                ), row=2, col=1)
-                _fig_intra.add_trace(go.Scatter(
-                    x=_ts, y=_macd["signal"],
-                    line=dict(color="#f6ad55", width=1.5, dash="dot"),
-                    name="Signal", showlegend=False,
-                ), row=2, col=1)
-            _fig_intra.update_layout(
-                height=420 if _has_macd else 280,
-                margin=dict(l=0, r=0, t=8, b=4),
-                paper_bgcolor="rgba(0,0,0,0)",
-                plot_bgcolor="rgba(0,0,0,0)",
-                font=dict(color="#e2e8f0", size=11),
-                xaxis_rangeslider_visible=False,
-            )
-            _fig_intra.update_xaxes(gridcolor="#2d3748", showgrid=True)
-            _fig_intra.update_yaxes(gridcolor="#2d3748", showgrid=True)
-            st.plotly_chart(_fig_intra, width='stretch',
-                            config={"staticPlot": True})
-
-            if _has_macd:
-                _sig = _macd.get("signal_str", "")
-                _verdicts = {
-                    "bullish_crossover": ("🟢", "Bullish crossover — momentum just turned up",  "#1a3a2a", "#48bb78"),
-                    "bearish_crossover": ("🔴", "Bearish crossover — momentum just turned down", "#3a1a1a", "#fc8181"),
-                    "bullish_trend":     ("🔵", "Above signal line — uptrend in progress",       "#1a2a3a", "#90cdf4"),
-                    "bearish_trend":     ("⚪", "Below signal line — downtrend in progress",     "#1e2130", "#718096"),
-                }
-                _icon, _text, _bg, _border = _verdicts.get(_sig, ("⚪", _sig, "#1e2130", "#718096"))
-                _zero = "MACD above zero ✓" if _macd.get("above_zero") else "MACD below zero"
-                st.markdown(
-                    f'<div class="macd-verdict" style="background:{_bg};border-left-color:{_border}">'
-                    f'{_icon} <strong>{_selected}</strong> — {_text} &nbsp;·&nbsp; {_zero}</div>',
-                    unsafe_allow_html=True,
-                )
-                if _src == "yfinance_delayed":
-                    st.caption("⚠️ Alpaca returned no IEX data — using yfinance (15-min delay)")
-        else:
-            st.caption(f"No intraday data available for {_selected} yet.")
 
 with tab2:
     # ── Daily Options Play ────────────────────────────────────────────────────
@@ -1845,17 +1910,68 @@ with tab4:
 
         display_df = df.drop(columns=["_near_stop"])
 
+        show_cards = st.checkbox(
+            "Show cards", 
+            value=True,
+            help="Cleaner per-position view (entry/stop/target + quality + P&L).",
+            key="portfolio_show_cards",
+        )
+
+        if show_cards:
+            for row in rows:
+                sym = row["Symbol"]
+                pnl_raw = float(row.get("P&L", "0").replace("$", "")) if isinstance(row.get("P&L"), str) else float(row.get("_pnl_raw", 0) or 0)
+                pnl_col = "#00d4aa" if (str(row["P&L"]).startswith("$+" ) or str(row["P&L"]).startswith("+") ) else "#ff4b4b"
+                st.markdown(f"""
+                    <div class='analysis-card' style='border-left:4px solid #2d3250; background:#0f162a; margin-top:10px;'>
+                      <div style='display:flex; justify-content:space-between; align-items:flex-start; gap:14px;'>
+                        <div>
+                          <div style='font-weight:900; font-size:1.08em; color:#e2e8f0;'>{sym}</div>
+                          <div style='margin-top:4px; color:#a0aec0; font-size:0.85em;'>{row['Quality']} · Qty {row['Qty']:.0f}</div>
+                        </div>
+                        <div style='text-align:right;'>
+                          <div style='font-weight:900; font-size:1.08em; color:{pnl_col};'>{row['P&L']}</div>
+                          <div style='color:#718096; font-size:0.82em; margin-top:2px;'>{row['P&L %']}</div>
+                        </div>
+                      </div>
+
+                      <div class='level-grid' style='margin-top:12px;'>
+                        <div class='level-box'>
+                          <div class='level-label'>Entry</div>
+                          <div class='level-value'>{row['Avg Entry']}</div>
+                        </div>
+                        <div class='level-box level-stop'>
+                          <div class='level-label'>Stop</div>
+                          <div class='level-value'>{row['Stop']}</div>
+                          <div class='level-sub'>{row['→ Stop']}</div>
+                        </div>
+                        <div class='level-box level-target'>
+                          <div class='level-label'>Target</div>
+                          <div class='level-value'>{row['Target']}</div>
+                          <div class='level-sub'>{row['→ Target']}</div>
+                        </div>
+                        <div class='level-box'>
+                          <div class='level-label'>R/R</div>
+                          <div class='level-value'>{row['R/R']}</div>
+                          <div class='level-sub'>Open {row['Open R']}</div>
+                        </div>
+                      </div>
+                    </div>
+                """, unsafe_allow_html=True)
+
+
         def color_pl(val):
             s = str(val)
             if s.startswith("+") or (s.startswith("$+") ): return "color:#00d4aa"
             if "-" in s: return "color:#ff4b4b"
             return ""
 
-        st.dataframe(
-            display_df.style.map(color_pl, subset=["P&L", "P&L %", "→ Stop", "→ Target"]),
-            width='stretch',
-            hide_index=True
-        )
+        if not show_cards:
+            st.dataframe(
+                display_df.style.map(color_pl, subset=["P&L", "P&L %", "→ Stop", "→ Target"]),
+                width='stretch',
+                hide_index=True,
+            )
 
         if len(positions) > 0:
             syms   = [p["symbol"] for p in positions]
@@ -1865,9 +1981,15 @@ with tab4:
                 x=syms, y=pl_vals, marker_color=colors,
                 text=[f"${v:+.2f}" for v in pl_vals], textposition="outside"
             ))
-            fig.update_layout(title="Unrealized P&L by Position", yaxis_title="USD",
-                              height=260, plot_bgcolor="#0e1117", paper_bgcolor="#0e1117",
-                              font_color="#fafafa", margin=dict(t=40,b=20))
+            fig.update_layout(
+                title="Unrealized P&L by Position",
+                yaxis_title="USD",
+                height=260,
+                plot_bgcolor="#0e1117",
+                paper_bgcolor="#0e1117",
+                font_color="#fafafa",
+                margin=dict(t=40, b=20),
+            )
             st.plotly_chart(fig, width='stretch')
     else:
         st.info("No open positions.")
